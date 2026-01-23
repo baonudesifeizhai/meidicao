@@ -4,8 +4,7 @@ from tpo_mm_policy_v5 import VLLMOpenAIMMPolicyV5
 ds = load_dataset("mdwiratathya/SLAKE-vqa-english", split="test", streaming=True)
 it = iter(ds)
 policy = VLLMOpenAIMMPolicyV5("http://localhost:8000/v1", "medgemma-27b-it")
-
-# 这 10 条里 Q4/Q6/Q8 是关键
+ 
 targets = {4,6,8}
 
 for qi in range(10):

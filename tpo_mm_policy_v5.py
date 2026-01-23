@@ -164,8 +164,9 @@ class VLLMOpenAIMMPolicyV5:
         img_url = pil_to_data_url(image)
         payload = {
             "model": self.model,
-            "n": 1,
-            "temperature": 0.0,
+            "n": int(max(1, n)),
+            "temperature": float(temperature),
+            "top_p": float(top_p),
             "max_tokens": max_tokens,
             "messages": [{
                 "role": "user",
@@ -176,5 +177,9 @@ class VLLMOpenAIMMPolicyV5:
             }],
         }
         raw = self._post(payload)
-        ans = raw["choices"][0]["message"]["content"].strip()
-        return GenOut(texts=[ans]*n, voted=ans, raw=raw, qtype=qtype)
+        texts = [c["message"]["content"].strip() for c in raw.get("choices", [])]
+        if not texts:
+            texts = ["Unknown"] * int(max(1, n))
+        norm_texts = [normalize_text(t) for t in texts]
+        voted = max(norm_texts, key=norm_texts.count)
+        return GenOut(texts=texts, voted=voted, raw=raw, qtype=qtype)
