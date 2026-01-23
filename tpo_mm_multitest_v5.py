@@ -5,7 +5,7 @@ ds = load_dataset("mdwiratathya/SLAKE-vqa-english", split="test", streaming=True
 it = iter(ds)
 policy = VLLMOpenAIMMPolicyV5("http://localhost:8000/v1", "medgemma-27b-it")
 
-targets = {4,6,8}
+targets = set(range(20))
 
 for qi in range(10):
     ex = next(it)
@@ -15,7 +15,7 @@ for qi in range(10):
     q = ex["question"]
     gt = ex.get("answer", None)
 
-    out = policy.generate_n_mm(img, q, n=5, use_gate=False)
+    out = policy.generate_n_mm(img, q, n=5, use_gate=False, temperature=1.2, top_p=0.85)
 
     print("=" * 70)
     print(f"[Q{qi}] type={out.qtype}")

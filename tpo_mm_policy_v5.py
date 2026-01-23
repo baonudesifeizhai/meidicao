@@ -55,9 +55,8 @@ def rules_for(qtype: str) -> Tuple[str,int]:
         )
     if qtype in ("contain_yesno","healthy_yesno"):
         return (
-            "Output ONLY: Yes, No, or Unknown.\n"
-            "If image evidence is unclear, output Unknown (do NOT guess). Output only the answer.",
-            6,
+            "Output a SHORT answer (1-3 words). If not confident, output Unknown.",
+            8,
         )
     if qtype == "disease":
         return (
