@@ -15,7 +15,7 @@ for qi in range(10):
     q = ex["question"]
     gt = ex.get("answer", None)
 
-    out = policy.generate_n_mm(img, q, n=5)
+    out = policy.generate_n_mm(img, q, n=5, use_gate=False)
 
     print("=" * 70)
     print(f"[Q{qi}] type={out.qtype}")

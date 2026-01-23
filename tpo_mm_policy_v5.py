@@ -113,13 +113,22 @@ class VLLMOpenAIMMPolicyV5:
         raw = self._post(payload)
         return raw["choices"][0]["message"]["content"].strip()
 
-    def generate_n_mm(self, image: Image.Image, question: str, n: int = 5, temperature: float = 0.7, top_p: float = 0.95, max_tokens: Optional[int]=None) -> GenOut:
+    def generate_n_mm(
+        self,
+        image: Image.Image,
+        question: str,
+        n: int = 5,
+        temperature: float = 0.7,
+        top_p: float = 0.95,
+        max_tokens: Optional[int] = None,
+        use_gate: bool = True,
+    ) -> GenOut:
         qtype = classify_question(question)
         rules, default_max = rules_for(qtype)
         max_tokens = int(max_tokens or default_max)
 
         # -------- contain gate (heart gets stricter wording) --------
-        if qtype == "contain_yesno":
+        if use_gate and qtype == "contain_yesno":
             m = re.search(r"contain\s+(.+?)\?", (question or "").lower())
             organ = (m.group(1) if m else "the organ").strip()
 
@@ -147,7 +156,7 @@ class VLLMOpenAIMMPolicyV5:
             return GenOut(texts=["Unknown"]*n, voted="Unknown", raw={"gate":"Unclear"}, qtype=qtype)
 
         # -------- keep healthy gate conservative --------
-        if qtype == "healthy_yesno":
+        if use_gate and qtype == "healthy_yesno":
             gate_q = (
                 "Answer ONLY one token: Abnormal, NoAbnormal, or Unclear.\n"
                 "Is there any visible abnormality in the lung on this image?"
