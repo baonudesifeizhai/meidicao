@@ -35,6 +35,10 @@ TPO_STEPS = 2
 TPO_TEMPERATURE = 0.9
 TPO_TOP_P = 0.9
 FINAL_TEMPERATURE = 0.0
+CONSENSUS_WEIGHT = 0.6
+ANCHOR_BONUS = 0.3
+NEW_NORM_PENALTY = 0.15
+UNKNOWN_PENALTY = 0.6
 
 MAX_QUESTIONS = 8
 MAX_SCAN = 400
@@ -96,15 +100,17 @@ def _format_score(text, norm, qtype):
     return max(0.0, base)
 
 
-def _score_candidate(text, qtype, freq_map, pool_size):
+def _score_candidate(text, qtype, freq_map, pool_size, anchor_norm=None, init_norms=None):
     norm = normalize_answer(text, qtype)
     freq = freq_map.get(norm, 0) / max(1, pool_size)
     fmt = _format_score(text, norm, qtype)
-    unknown_penalty = 0.4 if norm == "Unknown" else 0.0
-    return fmt + (0.6 * freq) - unknown_penalty
+    unknown_penalty = UNKNOWN_PENALTY if norm == "Unknown" else 0.0
+    anchor_bonus = ANCHOR_BONUS if anchor_norm and norm == anchor_norm else 0.0
+    new_norm_penalty = NEW_NORM_PENALTY if init_norms and norm not in init_norms else 0.0
+    return fmt + (CONSENSUS_WEIGHT * freq) + anchor_bonus - unknown_penalty - new_norm_penalty
 
 
-def _select_top_k(scored, k):
+def _select_top_k(scored, k, anchor_norm=None):
     selected = []
     seen = set()
     for score, text, norm in scored:
@@ -114,23 +120,44 @@ def _select_top_k(scored, k):
         seen.add(norm)
         if len(selected) >= k:
             break
+    if anchor_norm and scored and all(n != anchor_norm for _, _, n in selected):
+        for score, text, norm in scored:
+            if norm == anchor_norm:
+                selected.append((score, text, norm))
+                break
+    if len(selected) > k:
+        selected = selected[:k]
     if not selected and scored:
         selected = [scored[0]]
     return selected
 
 
-def tpo_optimize_text(policy, question, qtype, candidates):
+def tpo_optimize_text(policy, question, qtype, candidates, anchor_text=None):
     pool = candidates[:]
     rules, _ = rules_for(qtype)
-    for _ in range(TPO_STEPS):
+    init_norms = {normalize_answer(t, qtype) for t in candidates}
+    if not anchor_text and candidates:
+        anchor_text = candidates[0]
+    anchor_norm = normalize_answer(anchor_text, qtype) if anchor_text else None
+
+    for step in range(TPO_STEPS):
         norm_pool = [normalize_answer(t, qtype) for t in pool]
         freq_map = Counter(norm_pool)
         scored = [
-            (_score_candidate(t, qtype, freq_map, len(pool)), t, n)
+            (_score_candidate(t, qtype, freq_map, len(pool), anchor_norm, init_norms), t, n)
             for t, n in zip(pool, norm_pool)
         ]
         scored.sort(key=lambda x: x[0], reverse=True)
-        selected = _select_top_k(scored, TOP_K)
+        selected = _select_top_k(scored, TOP_K, anchor_norm)
+
+        print(f"Round {step + 1} pool (score | norm | text):")
+        for i, (score, text, norm) in enumerate(scored, 1):
+            anchor_tag = " [anchor]" if anchor_norm and norm == anchor_norm else ""
+            print(f"  {i:02d}. {score:.2f} | {norm} | {text}{anchor_tag}")
+        print(f"Round {step + 1} selected (score | norm | text):")
+        for i, (score, text, norm) in enumerate(selected, 1):
+            anchor_tag = " [anchor]" if anchor_norm and norm == anchor_norm else ""
+            print(f"  {i:02d}. {score:.2f} | {norm} | {text}{anchor_tag}")
 
         new_candidates = []
         for _, text, _ in selected:
@@ -151,15 +178,19 @@ def tpo_optimize_text(policy, question, qtype, candidates):
             )
 
         pool = [t for _, t, _ in selected] + new_candidates
+        if anchor_text and anchor_norm and all(normalize_answer(t, qtype) != anchor_norm for t in pool):
+            pool.append(anchor_text)
         if len(pool) > POOL_SIZE:
             norm_pool = [normalize_answer(t, qtype) for t in pool]
             freq_map = Counter(norm_pool)
             scored = [
-                (_score_candidate(t, qtype, freq_map, len(pool)), t, n)
+                (_score_candidate(t, qtype, freq_map, len(pool), anchor_norm, init_norms), t, n)
                 for t, n in zip(pool, norm_pool)
             ]
             scored.sort(key=lambda x: x[0], reverse=True)
             pool = [t for _, t, _ in scored[:POOL_SIZE]]
+            if anchor_text and anchor_norm and all(normalize_answer(t, qtype) != anchor_norm for t in pool):
+                pool[-1] = anchor_text
 
     voted, _ = vote_texts(pool, qtype)
     return pool, voted
@@ -203,7 +234,9 @@ for qi in range(MAX_SCAN):
     refined_texts = init_out.texts
     refined_voted = init_voted
     if qtype not in YESNO_TYPES:
-        refined_texts, refined_voted = tpo_optimize_text(policy, q, qtype, init_out.texts)
+        refined_texts, refined_voted = tpo_optimize_text(
+            policy, q, qtype, init_out.texts, anchor_text=init_voted
+        )
 
     final_ans = final_verify(policy, img, q, qtype, refined_voted)
 
