@@ -6,12 +6,13 @@ it = iter(ds)
 policy = VLLMOpenAIMMPolicyV5("http://localhost:8000/v1", "medgemma-27b-it")
 
 targets = None
-max_questions = 20
-max_non_yesno = 12
+max_questions = 30
+max_non_yesno = 20
+max_scan = 200
 seen = 0
 seen_non_yesno = 0
 
-for qi in range(10):
+for qi in range(max_scan):
     ex = next(it)
     if targets is not None and qi not in targets:
         continue
@@ -27,7 +28,7 @@ for qi in range(10):
         seen_non_yesno += 1
 
     seen += 1
-    if seen > max_questions:
+    if seen >= max_questions:
         break
 
     out = policy.generate_n_mm(img, q, n=5, use_gate=True, temperature=1.2, top_p=0.85)
