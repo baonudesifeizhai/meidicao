@@ -192,6 +192,21 @@ class VLLMOpenAIMMPolicyV5:
         raw = self._post(payload)
         return raw["choices"][0]["message"]["content"].strip()
 
+    def generate_n_text(self, prompt: str, n: int = 5, temperature: float = 0.7, top_p: float = 0.95, max_tokens: int = 64) -> List[str]:
+        payload = {
+            "model": self.model,
+            "n": int(max(1, n)),
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "max_tokens": int(max_tokens),
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        raw = self._post(payload)
+        texts = [c["message"]["content"].strip() for c in raw.get("choices", [])]
+        if not texts:
+            texts = ["Unknown"] * int(max(1, n))
+        return texts
+
     def generate_n_mm(
         self,
         image: Image.Image,
