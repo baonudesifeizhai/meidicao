@@ -170,11 +170,17 @@ class VLLMOpenAIMMPolicyV5:
         # -------- fallback: just ask once with rules (and replicate n) --------
         # (你现在主要用 gate 的 qtype，其他题不需要多采样了；先简单稳定)
         img_url = pil_to_data_url(image)
+        if qtype in ("contain_yesno", "healthy_yesno"):
+            sample_temp = 0.2
+            sample_top_p = min(float(top_p), 0.9)
+        else:
+            sample_temp = float(temperature)
+            sample_top_p = float(top_p)
         payload = {
             "model": self.model,
             "n": int(max(1, n)),
-            "temperature": float(temperature),
-            "top_p": float(top_p),
+            "temperature": sample_temp,
+            "top_p": sample_top_p,
             "max_tokens": max_tokens,
             "messages": [{
                 "role": "user",
