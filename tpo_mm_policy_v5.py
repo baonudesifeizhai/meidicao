@@ -49,28 +49,31 @@ def classify_question(q: str) -> str:
 def rules_for(qtype: str) -> Tuple[str,int]:
     if qtype == "modality":
         return (
-            "Answer briefly with the imaging modality (1-3 words). If unsure, output Unknown.",
+            "Output ONLY the imaging modality (1-3 words). No sentences or explanations.\n"
+            "If unsure, output Unknown.",
             8,
         )
     if qtype in ("contain_yesno","healthy_yesno"):
         return (
-            "Answer briefly (1-3 words). If unsure, output Unknown.",
+            "Answer briefly (1-3 words). No sentences or explanations.\n"
+            "If unsure, output Unknown.",
             8,
         )
     if qtype == "disease":
         return (
-            "Answer briefly with disease name(s), 1-6 words. You may list multiple items separated by commas.\n"
-            "If unsure, output Unknown.",
-            16,
+            "Output ONLY disease name(s), 1-6 words total. No sentences or explanations.\n"
+            "You may list multiple items separated by commas. If unsure, output Unknown.",
+            12,
         )
     if qtype == "location":
         return (
-            "Answer briefly with location(s), 1-6 words. You may list multiple items separated by commas.\n"
-            "If unsure, output Unknown.",
-            16,
+            "Output ONLY location(s), 1-6 words total. No sentences or explanations.\n"
+            "You may list multiple items separated by commas. If unsure, output Unknown.",
+            12,
         )
     return (
-        "Answer briefly (1-6 words). You may list multiple items separated by commas. If unsure, output Unknown.",
+        "Answer briefly (1-6 words). No sentences or explanations.\n"
+        "You may list multiple items separated by commas. If unsure, output Unknown.",
         12,
     )
 
