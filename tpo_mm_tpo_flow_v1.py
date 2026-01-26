@@ -258,40 +258,64 @@ def _parse_score(text):
     return val / 10.0
 
 
-def _review_score(reviewers, cache, question, qtype, answer, rules):
+def _parse_choice(text, max_choice):
+    match = re.search(r"\b(\d{1,2})\b", text or "")
+    if not match:
+        return None
+    choice = int(match.group(1))
+    if 1 <= choice <= max_choice:
+        return choice
+    return None
+
+
+def _review_scores_for_pool(reviewers, cache, question, qtype, pool_texts, rules):
     if not reviewers or REVIEW_WEIGHT <= 0:
-        return 0.0
-    norm = normalize_answer(answer, qtype)
-    total = 0.0
+        return {}
+    norm_to_text = {}
+    for text in pool_texts:
+        norm = normalize_answer(text, qtype)
+        if norm not in norm_to_text:
+            norm_to_text[norm] = " ".join((text or "").split())
+    norms = list(norm_to_text.keys())
+    if not norms:
+        return {}
+    prompt = (
+        "You are a medical QA evaluator. Choose the best answer among candidates.\n"
+        "Consider format compliance and semantic relevance. Do NOT use image evidence.\n"
+        f"{rules}\n"
+        f"Question: {question}\n"
+        "Candidates:\n"
+    )
+    for i, text in enumerate(norm_to_text.values(), 1):
+        prompt += f"{i}. {text}\n"
+    prompt += "Return ONLY the number of the best answer."
+    scores = {norm: 0.0 for norm in norms}
     weight_sum = 0.0
     for cfg, reviewer in reviewers:
-        key = (cfg["name"], qtype, question, norm)
+        key = (cfg["name"], qtype, question, tuple(norms))
         if key not in cache:
-            prompt = (
-                "You are a medical QA evaluator. Score the answer quality for the question.\n"
-                "Consider format compliance and semantic relevance. Do NOT use image evidence.\n"
-                f"{rules}\n"
-                f"Question: {question}\n"
-                f"Answer: {answer}\n"
-                "Output format: Score: <0-10>. Output only that line."
-            )
             raw = reviewer.generate(prompt)
-            score = _parse_score(raw)
+            choice = _parse_choice(raw, len(norms))
             if REVIEW_DEBUG:
                 raw_display = " ".join((raw or "").split())
-                score_display = "None" if score is None else f"{score:.2f}"
+                choice_display = "None" if choice is None else str(choice)
+                picked = "None" if choice is None else norms[choice - 1]
                 print(
-                    f"  RM[{cfg['name']}] norm={norm} raw={raw_display!r} parsed={score_display}"
+                    f"  RM[{cfg['name']}] choice={choice_display} norm={picked} raw={raw_display!r}"
                 )
-            cache[key] = score
+            cache[key] = choice
         cached = cache.get(key)
         if cached is None:
             continue
-        total += cached * cfg.get("weight", 1.0)
-        weight_sum += cfg.get("weight", 1.0)
+        weight = cfg.get("weight", 1.0)
+        picked_norm = norms[cached - 1]
+        scores[picked_norm] += weight
+        weight_sum += weight
     if weight_sum <= 0:
-        return 0.0
-    return total / weight_sum
+        return {}
+    for norm in scores:
+        scores[norm] = scores[norm] / weight_sum
+    return scores
 
 
 def _score_candidate(
@@ -361,9 +385,12 @@ def tpo_optimize_text(
     for step in range(TPO_STEPS):
         norm_pool = [normalize_answer(t, qtype) for t in pool]
         freq_map = Counter(norm_pool)
+        review_scores = _review_scores_for_pool(
+            reviewers, review_cache, question, qtype, pool, rules
+        )
         scored = []
         for t, n in zip(pool, norm_pool):
-            review = _review_score(reviewers, review_cache, question, qtype, t, rules)
+            review = review_scores.get(n, 0.0)
             score = _score_candidate(
                 t, qtype, freq_map, len(pool), anchor_norm, init_norms, review
             )
@@ -406,9 +433,12 @@ def tpo_optimize_text(
         if len(pool) > POOL_SIZE:
             norm_pool = [normalize_answer(t, qtype) for t in pool]
             freq_map = Counter(norm_pool)
+            review_scores = _review_scores_for_pool(
+                reviewers, review_cache, question, qtype, pool, rules
+            )
             scored = []
             for t, n in zip(pool, norm_pool):
-                review = _review_score(reviewers, review_cache, question, qtype, t, rules)
+                review = review_scores.get(n, 0.0)
                 score = _score_candidate(
                     t, qtype, freq_map, len(pool), anchor_norm, init_norms, review
                 )
