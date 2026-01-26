@@ -32,14 +32,15 @@ POOL_SIZE = 10
 TOP_K = 3
 MUTATE_N = 2
 TPO_STEPS = 2
-TPO_TEMPERATURE = 0.9
-TPO_TOP_P = 0.9
+TPO_TEMPERATURE = 1.1
+TPO_TOP_P = 0.85
 FINAL_TEMPERATURE = 0.0
 CONSENSUS_WEIGHT = 0.6
 ANCHOR_BONUS = 0.3
 NEW_NORM_PENALTY = 0.15
 UNKNOWN_PENALTY = 0.6
 REVIEW_WEIGHT = 0.8
+REVIEW_DEBUG = True
 
 MAX_QUESTIONS = 8
 MAX_SCAN = 400
@@ -249,6 +250,12 @@ def _review_score(reviewers, cache, question, qtype, answer, rules):
             )
             raw = reviewer.generate(prompt)
             score = _parse_score(raw)
+            if REVIEW_DEBUG:
+                raw_display = " ".join((raw or "").split())
+                score_display = "None" if score is None else f"{score:.2f}"
+                print(
+                    f"  RM[{cfg['name']}] norm={norm} raw={raw_display!r} parsed={score_display}"
+                )
             cache[key] = 0.5 if score is None else score
         total += cache[key] * cfg.get("weight", 1.0)
         weight_sum += cfg.get("weight", 1.0)
@@ -349,7 +356,9 @@ def tpo_optimize_text(
                 f"{rules}\n"
                 f"Question: {question}\n"
                 f"Candidate answer: {text}\n"
-                "Improve the answer while keeping it concise and in the required format. Output only the answer."
+                "Generate a concise alternative answer in the required format. "
+                "Prefer a different plausible answer than the candidate when possible. "
+                "Output only the answer."
             )
             new_candidates.extend(
                 policy.generate_n_text(
