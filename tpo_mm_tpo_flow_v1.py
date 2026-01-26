@@ -42,6 +42,9 @@ UNKNOWN_PENALTY = 0.6
 REVIEW_WEIGHT = 0.8
 REVIEW_DEBUG = True
 REVIEW_MAX_TOKENS = 12
+SPECIFICITY_PENALTY_LOBE = 0.15
+SPECIFICITY_PENALTY_COMMA = 0.08
+SPECIFICITY_PENALTY_MAX = 0.3
 
 MAX_QUESTIONS = 8
 MAX_SCAN = 400
@@ -128,6 +131,19 @@ def _format_score(text, norm, qtype):
     if re.search(r"[.!?]", text or ""):
         base -= 0.2
     return max(0.0, base)
+
+
+def _specificity_penalty(text, qtype):
+    if qtype not in ("location", "disease"):
+        return 0.0
+    tl = (text or "").lower()
+    penalty = 0.0
+    if re.search(r"\b(upper|lower)\s+lobe\b", tl):
+        penalty += SPECIFICITY_PENALTY_LOBE
+    comma_count = tl.count(",")
+    if comma_count:
+        penalty += SPECIFICITY_PENALTY_COMMA * comma_count
+    return min(penalty, SPECIFICITY_PENALTY_MAX)
 
 class VLLMReviewer:
     def __init__(self, base_url, model):
@@ -330,6 +346,7 @@ def _score_candidate(
     norm = normalize_answer(text, qtype)
     freq = freq_map.get(norm, 0) / max(1, pool_size)
     fmt = _format_score(text, norm, qtype)
+    specificity_penalty = _specificity_penalty(text, qtype)
     unknown_penalty = UNKNOWN_PENALTY if norm == "Unknown" else 0.0
     anchor_bonus = ANCHOR_BONUS if anchor_norm and norm == anchor_norm else 0.0
     new_norm_penalty = NEW_NORM_PENALTY if init_norms and norm not in init_norms else 0.0
@@ -339,6 +356,7 @@ def _score_candidate(
         + anchor_bonus
         - unknown_penalty
         - new_norm_penalty
+        - specificity_penalty
         + (REVIEW_WEIGHT * review_score)
     )
 
