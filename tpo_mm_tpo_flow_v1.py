@@ -41,6 +41,7 @@ NEW_NORM_PENALTY = 0.15
 UNKNOWN_PENALTY = 0.6
 REVIEW_WEIGHT = 0.8
 REVIEW_DEBUG = True
+REVIEW_MAX_TOKENS = 12
 
 MAX_QUESTIONS = 8
 MAX_SCAN = 400
@@ -68,6 +69,7 @@ REVIEWERS = [
         "dtype": "bfloat16",
         "device_map": "auto",
         "trust_remote_code": False,
+        "use_chat_template": True,
     },
 ]
 
@@ -133,16 +135,24 @@ class VLLMReviewer:
 
     def generate(self, prompt):
         return self.policy.generate_n_text(
-            prompt, n=1, temperature=0.0, top_p=1.0, max_tokens=4
+            prompt, n=1, temperature=0.0, top_p=1.0, max_tokens=REVIEW_MAX_TOKENS
         )[0]
 
 
 class HFReviewer:
-    def __init__(self, model_id, dtype="bfloat16", device_map="auto", trust_remote_code=False):
+    def __init__(
+        self,
+        model_id,
+        dtype="bfloat16",
+        device_map="auto",
+        trust_remote_code=False,
+        use_chat_template=False,
+    ):
         self.model_id = model_id
         self.dtype = dtype
         self.device_map = device_map
         self.trust_remote_code = trust_remote_code
+        self.use_chat_template = use_chat_template
         self._model = None
         self._tokenizer = None
 
@@ -185,12 +195,28 @@ class HFReviewer:
             self._load()
         import torch
 
-        inputs = self._tokenizer(prompt, return_tensors="pt")
+        if (
+            self.use_chat_template
+            and hasattr(self._tokenizer, "apply_chat_template")
+            and getattr(self._tokenizer, "chat_template", None)
+        ):
+            input_ids = self._tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
+            inputs = {
+                "input_ids": input_ids,
+                "attention_mask": torch.ones_like(input_ids),
+            }
+        else:
+            inputs = self._tokenizer(prompt, return_tensors="pt")
         inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
         with torch.inference_mode():
             output_ids = self._model.generate(
                 **inputs,
-                max_new_tokens=4,
+                max_new_tokens=REVIEW_MAX_TOKENS,
                 do_sample=False,
                 temperature=0.0,
                 top_p=1.0,
@@ -210,6 +236,7 @@ def build_reviewers(configs):
                 dtype=cfg.get("dtype", "bfloat16"),
                 device_map=cfg.get("device_map", "auto"),
                 trust_remote_code=cfg.get("trust_remote_code", False),
+                use_chat_template=cfg.get("use_chat_template", False),
             )
         else:
             client = VLLMReviewer(cfg["base_url"], cfg["model"])
@@ -246,7 +273,7 @@ def _review_score(reviewers, cache, question, qtype, answer, rules):
                 f"{rules}\n"
                 f"Question: {question}\n"
                 f"Answer: {answer}\n"
-                "Return ONLY a number from 0 to 10."
+                "Output format: Score: <0-10>. Output only that line."
             )
             raw = reviewer.generate(prompt)
             score = _parse_score(raw)
@@ -256,8 +283,11 @@ def _review_score(reviewers, cache, question, qtype, answer, rules):
                 print(
                     f"  RM[{cfg['name']}] norm={norm} raw={raw_display!r} parsed={score_display}"
                 )
-            cache[key] = 0.5 if score is None else score
-        total += cache[key] * cfg.get("weight", 1.0)
+            cache[key] = score
+        cached = cache.get(key)
+        if cached is None:
+            continue
+        total += cached * cfg.get("weight", 1.0)
         weight_sum += cfg.get("weight", 1.0)
     if weight_sum <= 0:
         return 0.0
