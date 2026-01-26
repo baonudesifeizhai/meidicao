@@ -149,6 +149,12 @@ class HFReviewer:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
+            torch.backends.cuda.sdp_kernel(
+                enable_math=True,
+                enable_flash=False,
+                enable_mem_efficient=False,
+            )
         if self.dtype == "float16":
             torch_dtype = torch.float16
         elif self.dtype == "float32":
@@ -156,12 +162,21 @@ class HFReviewer:
         else:
             torch_dtype = torch.bfloat16
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_id)
-        self._model = AutoModelForCausalLM.from_pretrained(
-            self.model_id,
-            device_map=self.device_map,
-            torch_dtype=torch_dtype,
-            trust_remote_code=self.trust_remote_code,
-        )
+        try:
+            self._model = AutoModelForCausalLM.from_pretrained(
+                self.model_id,
+                device_map=self.device_map,
+                torch_dtype=torch_dtype,
+                trust_remote_code=self.trust_remote_code,
+                attn_implementation="eager",
+            )
+        except TypeError:
+            self._model = AutoModelForCausalLM.from_pretrained(
+                self.model_id,
+                device_map=self.device_map,
+                torch_dtype=torch_dtype,
+                trust_remote_code=self.trust_remote_code,
+            )
         self._model.eval()
 
     def generate(self, prompt):
