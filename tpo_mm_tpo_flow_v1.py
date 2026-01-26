@@ -292,7 +292,7 @@ def _select_top_k(scored, k, anchor_norm=None):
         seen.add(norm)
         if len(selected) >= k:
             break
-    if anchor_norm and scored and all(n != anchor_norm for _, _, n in selected):
+    if anchor_norm and scored and all(n != anchor_norm for _, _, n, _ in selected):
         for score, text, norm, review in scored:
             if norm == anchor_norm:
                 selected.append((score, text, norm, review))
