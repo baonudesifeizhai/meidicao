@@ -226,8 +226,27 @@ def _parse_candidate_lines(raw: str):
     for line in lines:
         line = re.sub(r"^\s*(?:\d+[\.\)]|[-*])\s*", "", line)
         line = re.sub(r"^(answer|candidate)\s*:\s*", "", line, flags=re.I)
-        if line:
-            cleaned.append(line)
+        lower = line.lower()
+        if not line:
+            continue
+        # Drop preambles or meta text from model output.
+        if any(
+            kw in lower
+            for kw in (
+                "here are",
+                "candidate answer",
+                "candidate answers",
+                "distinct candidate",
+                "based on the image",
+                "answers for the",
+            )
+        ):
+            continue
+        if lower.endswith(":"):
+            continue
+        if _word_count(line) > 8:
+            continue
+        cleaned.append(line)
     return cleaned
 
 
@@ -929,16 +948,21 @@ for dataset_name, dataset_id, split in DATASETS:
                 init_voted = anchor_text
             init_samples = list(init_texts)
             init_stats = _disagreement_stats(init_samples, qtype)
-            if init_stats["unique"] < MIN_UNIQUE or init_stats["disagree"] < MIN_DISAGREE:
-                continue
-
-            expanded_texts = _expand_candidates(policy, img, q, qtype, init_samples)
-            if len(expanded_texts) > len(init_samples):
-                print(f"  [Candidate expansion: {len(init_samples)} -> {len(expanded_texts)}]")
+            skip_tpo = init_stats["unique"] < MIN_UNIQUE or init_stats["disagree"] < MIN_DISAGREE
+            if skip_tpo:
+                print(
+                    f"  [Skipping TPO: low disagreement/unique "
+                    f"(unique={init_stats['unique']}, disagree={init_stats['disagree']:.2f})]"
+                )
+                expanded_texts = list(init_samples)
+            else:
+                expanded_texts = _expand_candidates(policy, img, q, qtype, init_samples)
+                if len(expanded_texts) > len(init_samples):
+                    print(f"  [Candidate expansion: {len(init_samples)} -> {len(expanded_texts)}]")
 
             refined_texts = expanded_texts
             refined_voted = init_voted
-            if qtype not in YESNO_TYPES:
+            if qtype not in YESNO_TYPES and not skip_tpo:
                 # Use TPO for all questions to explore better answers
                 # But be conservative: strongly protect the initial voted answer
                 refined_texts, refined_voted = tpo_optimize_text(
