@@ -162,6 +162,8 @@ def _is_lung_related(question, candidates=None):
             return True
     return False
 
+USE_QWEN_REVIEWER = True  # Set False to disable Qwen2.5-VL reviewer
+
 REVIEWERS = [
     {
         "name": "medgemma",
@@ -170,13 +172,18 @@ REVIEWERS = [
         "model": "google/medgemma-27b-it",
         "weight": 1.0,
     },
-    {
-        "name": "qwen2.5-vl-7b",
-        "type": "vllm",
-        "base_url": "http://localhost:8001/v1",
-        "model": "Qwen/Qwen2.5-VL-7B-Instruct",
-        "weight": 1.0,
-    },
+]
+if USE_QWEN_REVIEWER:
+    REVIEWERS.append(
+        {
+            "name": "qwen2.5-vl-7b",
+            "type": "vllm",
+            "base_url": "http://localhost:8001/v1",
+            "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+            "weight": 1.0,
+        }
+    )
+REVIEWERS.append(
     {
         "name": "biomistral",
         "type": "hf",
@@ -186,8 +193,8 @@ REVIEWERS = [
         "device_map": {"": "cuda:3"},
         "trust_remote_code": False,
         "use_chat_template": True,
-    },
-]
+    }
+)
 
 
 def vote_texts(texts, qtype):
