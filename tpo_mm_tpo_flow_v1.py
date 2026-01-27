@@ -51,6 +51,84 @@ SPECIFICITY_PENALTY_MAX = 0.15
 MAX_QUESTIONS = 50
 MAX_SCAN = 400
 
+# Candidate expansion (ensure correct answers enter the pool)
+CANDIDATE_EXPAND_ENABLED = True
+CANDIDATE_EXPAND_N = 6
+CANDIDATE_EXPAND_TEMPERATURE = 0.7
+CANDIDATE_EXPAND_TOP_P = 0.9
+CANDIDATE_EXPAND_MAX_TOKENS = 80
+CANDIDATE_BANK_ENABLED = True
+CANDIDATE_BANK_MAX = 24
+MAX_INIT_POOL = 24
+
+CANDIDATE_BANK = {
+    "location": [
+        "Left lung",
+        "Right lung",
+        "Bilateral lungs",
+        "Left upper lobe",
+        "Left lower lobe",
+        "Right upper lobe",
+        "Right middle lobe",
+        "Right lower lobe",
+        "Mediastinum",
+        "Center",
+        "Heart",
+        "Chest",
+        "Thorax",
+        "Abdomen",
+        "Pelvis",
+        "Liver",
+        "Spleen",
+        "Pancreas",
+        "Kidney",
+        "Brain",
+        "Spine",
+        "Right atrium",
+        "Left atrium",
+        "Right ventricle",
+        "Left ventricle",
+    ],
+    "disease": [
+        "Cardiomegaly",
+        "Pneumonia",
+        "Pleural effusion",
+        "Atelectasis",
+        "Mass",
+        "Nodule",
+        "Edema",
+        "Emphysema",
+        "Fibrosis",
+        "Pneumothorax",
+        "Fracture",
+        "Hernia",
+        "Lung cancer",
+        "Infiltration",
+        "Consolidation",
+        "No finding",
+    ],
+    "short": [
+        "Lung",
+        "Heart",
+        "Liver",
+        "Spleen",
+        "Kidney",
+        "Brain",
+        "Stomach",
+        "Pancreas",
+        "Abdomen",
+        "Chest",
+        "Pelvis",
+        "Thorax",
+    ],
+}
+
+_STOPWORDS = {
+    "the", "is", "are", "in", "of", "on", "a", "an", "this", "that", "image", "picture",
+    "where", "what", "which", "location", "located", "abnormality", "abnormalities",
+    "main", "largest", "biggest", "most", "primary", "dominant",
+}
+
 REVIEWERS = [
     {
         "name": "medgemma",
@@ -109,6 +187,116 @@ def _disagreement_stats(texts, qtype):
         "counts": counts,
     }
 
+
+def _drop_unknown_if_possible(texts, qtype):
+    if not texts:
+        return texts
+    norms = [normalize_answer(t, qtype) for t in texts]
+    if any(n != "Unknown" for n in norms):
+        return [t for t, n in zip(texts, norms) if n != "Unknown"]
+    return texts
+
+
+def _force_non_unknown_answer(policy, image, question, qtype, tries=2):
+    rules, max_tokens = rules_for(qtype)
+    prompt = (
+        f"{rules}\n"
+        f"Question: {question}\n"
+        "Answer MUST be specific. Do NOT answer Unknown.\n"
+        "If unsure, give the single most likely answer.\n"
+        "Output only the answer."
+    )
+    best = "Unknown"
+    for i in range(tries):
+        temperature = 0.2 + (0.3 * i)
+        ans = policy._ask_once_mm(image, prompt, temperature=temperature, max_tokens=max_tokens)
+        if normalize_answer(ans, qtype) != "Unknown":
+            return ans
+        best = ans
+    return best
+
+
+def _parse_candidate_lines(raw: str):
+    if not raw:
+        return []
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    if len(lines) == 1 and ";" in lines[0]:
+        lines = [p.strip() for p in lines[0].split(";") if p.strip()]
+    cleaned = []
+    for line in lines:
+        line = re.sub(r"^\s*(?:\d+[\.\)]|[-*])\s*", "", line)
+        line = re.sub(r"^(answer|candidate)\s*:\s*", "", line, flags=re.I)
+        if line:
+            cleaned.append(line)
+    return cleaned
+
+
+def _dedup_candidates(texts, qtype):
+    seen = set()
+    out = []
+    for t in texts:
+        if not t:
+            continue
+        norm = normalize_answer(t, qtype)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(t)
+    return out
+
+
+def _select_bank_candidates(question, candidates, qtype):
+    if not CANDIDATE_BANK_ENABLED:
+        return []
+    bank = CANDIDATE_BANK.get(qtype, [])
+    if not bank:
+        return []
+    tokens = set(re.findall(r"[A-Za-z]+", (question or "").lower()))
+    for t in candidates:
+        tokens.update(re.findall(r"[A-Za-z]+", (t or "").lower()))
+    tokens = {t for t in tokens if t not in _STOPWORDS}
+    if tokens:
+        filtered = [b for b in bank if any(tok in b.lower() for tok in tokens)]
+        if len(filtered) >= 5:
+            return filtered[:CANDIDATE_BANK_MAX]
+    return bank[:CANDIDATE_BANK_MAX]
+
+
+def _expand_candidates(policy, image, question, qtype, existing):
+    if not CANDIDATE_EXPAND_ENABLED:
+        return existing
+    rules, max_tokens = rules_for(qtype)
+    prompt = (
+        f"{rules}\n"
+        f"Question: {question}\n"
+        f"Provide {CANDIDATE_EXPAND_N} DISTINCT candidate answers.\n"
+        "Each answer must be 1-6 words. Do NOT output Unknown.\n"
+        "Output as a numbered list, one answer per line."
+    )
+    if image is not None:
+        raw = policy._ask_once_mm(
+            image,
+            prompt,
+            temperature=CANDIDATE_EXPAND_TEMPERATURE,
+            max_tokens=CANDIDATE_EXPAND_MAX_TOKENS,
+        )
+        generated = _parse_candidate_lines(raw)
+    else:
+        raw = policy.generate_n_text(
+            prompt,
+            n=1,
+            temperature=CANDIDATE_EXPAND_TEMPERATURE,
+            top_p=CANDIDATE_EXPAND_TOP_P,
+            max_tokens=CANDIDATE_EXPAND_MAX_TOKENS,
+        )[0]
+        generated = _parse_candidate_lines(raw)
+    bank = _select_bank_candidates(question, existing, qtype)
+    merged = list(existing) + list(generated) + list(bank)
+    merged = _drop_unknown_if_possible(merged, qtype)
+    merged = _dedup_candidates(merged, qtype)
+    if len(merged) > MAX_INIT_POOL:
+        merged = merged[:MAX_INIT_POOL]
+    return merged
 
 def _format_score(text, norm, qtype):
     if qtype in YESNO_TYPES:
@@ -435,7 +623,7 @@ def tpo_optimize_text(
     review_cache=None,
     image=None,
 ):
-    pool = candidates[:]
+    pool = _drop_unknown_if_possible(candidates, qtype)
     rules, _ = rules_for(qtype)
     init_norms = {normalize_answer(t, qtype) for t in candidates}
     if not anchor_text and candidates:
@@ -724,15 +912,31 @@ for dataset_name, dataset_id, split in DATASETS:
             # Use deterministic baseline answer as anchor, plus diverse samples for exploration.
             anchor_out = policy.generate_n_mm(img, q, n=1, use_gate=True, temperature=0.0, top_p=1.0)
             anchor_text = anchor_out.texts[0] if anchor_out.texts else "Unknown"
+            if normalize_answer(anchor_text, qtype) == "Unknown":
+                forced = _force_non_unknown_answer(policy, img, q, qtype, tries=2)
+                if normalize_answer(forced, qtype) != "Unknown":
+                    anchor_text = forced
+                    print(f"  [Forced non-Unknown anchor: {anchor_text}]")
             diverse_n = max(1, INIT_N - 1)
             diverse_out = policy.generate_n_mm(img, q, n=diverse_n, use_gate=True, temperature=1.2, top_p=0.85)
             init_texts = [anchor_text] + [t for t in diverse_out.texts if t]
-            init_voted = anchor_text
-            init_stats = _disagreement_stats(init_texts, qtype)
+            init_texts = _drop_unknown_if_possible(init_texts, qtype)
+            if normalize_answer(anchor_text, qtype) == "Unknown" and any(
+                normalize_answer(t, qtype) != "Unknown" for t in init_texts
+            ):
+                init_voted, _ = vote_texts(init_texts, qtype)
+            else:
+                init_voted = anchor_text
+            init_samples = list(init_texts)
+            init_stats = _disagreement_stats(init_samples, qtype)
             if init_stats["unique"] < MIN_UNIQUE or init_stats["disagree"] < MIN_DISAGREE:
                 continue
 
-            refined_texts = init_texts
+            expanded_texts = _expand_candidates(policy, img, q, qtype, init_samples)
+            if len(expanded_texts) > len(init_samples):
+                print(f"  [Candidate expansion: {len(init_samples)} -> {len(expanded_texts)}]")
+
+            refined_texts = expanded_texts
             refined_voted = init_voted
             if qtype not in YESNO_TYPES:
                 # Use TPO for all questions to explore better answers
@@ -741,7 +945,7 @@ for dataset_name, dataset_id, split in DATASETS:
                     policy,
                     q,
                     qtype,
-                    init_texts,
+                    expanded_texts,
                     anchor_text=init_voted,
                     reviewers=reviewer_policies,
                     review_cache=review_cache,
@@ -756,7 +960,7 @@ for dataset_name, dataset_id, split in DATASETS:
             if gt is not None:
                 print("GT:", gt)
             print("init samples:")
-            for i, t in enumerate(init_texts):
+            for i, t in enumerate(init_samples):
                 print(f"  {i}: {t}")
             print(
                 f"init stats: unique={init_stats['unique']} "
@@ -778,7 +982,8 @@ for dataset_name, dataset_id, split in DATASETS:
                 "question": q,
                 "question_type": qtype,
                 "ground_truth": gt,
-                "init_samples": init_texts,
+                "init_samples": init_samples,
+                "expanded_samples": expanded_texts,
                 "init_voted": init_voted,
                 "init_stats": {
                     "unique": init_stats["unique"],
