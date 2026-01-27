@@ -34,19 +34,19 @@ POOL_SIZE = 10
 TOP_K = 3
 MUTATE_N = 2
 TPO_STEPS = 2
-TPO_TEMPERATURE = 1.1
-TPO_TOP_P = 0.85
+TPO_TEMPERATURE = 0.9
+TPO_TOP_P = 0.9
 FINAL_TEMPERATURE = 0.0
-CONSENSUS_WEIGHT = 0.6
-ANCHOR_BONUS = 0.3
-NEW_NORM_PENALTY = 0.15
+CONSENSUS_WEIGHT = 0.5
+ANCHOR_BONUS = 0.4
+NEW_NORM_PENALTY = 0.1
 UNKNOWN_PENALTY = 0.6
-REVIEW_WEIGHT = 0.8
+REVIEW_WEIGHT = 0.6
 REVIEW_DEBUG = True
 REVIEW_MAX_TOKENS = 12
-SPECIFICITY_PENALTY_LOBE = 0.15
-SPECIFICITY_PENALTY_COMMA = 0.08
-SPECIFICITY_PENALTY_MAX = 0.3
+SPECIFICITY_PENALTY_LOBE = 0.05
+SPECIFICITY_PENALTY_COMMA = 0.03
+SPECIFICITY_PENALTY_MAX = 0.15
 
 MAX_QUESTIONS = 50
 MAX_SCAN = 400
@@ -136,15 +136,18 @@ def _format_score(text, norm, qtype):
 
 
 def _specificity_penalty(text, qtype):
+    """Penalty for overly specific answers, but reduced to avoid penalizing correct detailed answers"""
     if qtype not in ("location", "disease"):
         return 0.0
     tl = (text or "").lower()
     penalty = 0.0
+    # Reduced penalty for lobe specificity (may be correct)
     if re.search(r"\b(upper|lower)\s+lobe\b", tl):
         penalty += SPECIFICITY_PENALTY_LOBE
+    # Reduced penalty for comma (may indicate multiple correct locations)
     comma_count = tl.count(",")
-    if comma_count:
-        penalty += SPECIFICITY_PENALTY_COMMA * comma_count
+    if comma_count > 2:  # Only penalize excessive commas (>2)
+        penalty += SPECIFICITY_PENALTY_COMMA * (comma_count - 2)
     return min(penalty, SPECIFICITY_PENALTY_MAX)
 
 class VLLMReviewer:
@@ -307,7 +310,9 @@ def _review_scores_for_pool(reviewers, cache, question, qtype, pool_texts, rules
     if image is not None:
         prompt = (
             "You are a medical QA evaluator. Choose the best answer among candidates.\n"
-            "Consider format compliance, semantic relevance, and image evidence.\n"
+            "Priority: Medical accuracy > Format compliance > Semantic relevance.\n"
+            "Use image evidence to verify which answer is most medically accurate.\n"
+            "Pay attention to anatomical details (left/right, specific locations, disease names).\n"
             f"{rules}\n"
             f"Question: {question}\n"
             "Candidates:\n"
@@ -315,7 +320,9 @@ def _review_scores_for_pool(reviewers, cache, question, qtype, pool_texts, rules
     else:
         prompt = (
             "You are a medical QA evaluator. Choose the best answer among candidates.\n"
-            "Consider format compliance and semantic relevance. Do NOT use image evidence.\n"
+            "Priority: Medical accuracy > Format compliance > Semantic relevance.\n"
+            "Pay attention to anatomical details (left/right, specific locations, disease names).\n"
+            "Do NOT use image evidence.\n"
             f"{rules}\n"
             f"Question: {question}\n"
             "Candidates:\n"
@@ -460,7 +467,8 @@ def tpo_optimize_text(
                 f"Question: {question}\n"
                 f"Candidate answer: {text}\n"
                 "Generate a concise alternative answer in the required format. "
-                "Prefer a different plausible answer than the candidate when possible. "
+                "The alternative should be medically plausible and accurate. "
+                "If the candidate is already accurate, generate a similar but slightly different formulation. "
                 "Output only the answer."
             )
             new_candidates.extend(
