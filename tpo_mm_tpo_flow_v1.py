@@ -416,14 +416,17 @@ def tpo_optimize_text(
         scored.sort(key=lambda x: x[0], reverse=True)
         selected = _select_top_k(scored, TOP_K, anchor_norm)
 
-        print(f"Round {step + 1} pool (score | rm | norm | text):")
+        print(f"Round {step + 1} pool (score | review_score | norm | text):")
+        print(f"  Note: review_score = reviewer投票权重 (0.0=未选中, >0=被选中)")
         for i, (score, text, norm, review) in enumerate(scored, 1):
             anchor_tag = " [anchor]" if anchor_norm and norm == anchor_norm else ""
-            print(f"  {i:02d}. {score:.2f} | {review:.2f} | {norm} | {text}{anchor_tag}")
-        print(f"Round {step + 1} selected (score | rm | norm | text):")
+            review_tag = " ✓" if review > 0 else ""
+            print(f"  {i:02d}. {score:.2f} | {review:.2f}{review_tag} | {norm} | {text}{anchor_tag}")
+        print(f"Round {step + 1} selected (score | review_score | norm | text):")
         for i, (score, text, norm, review) in enumerate(selected, 1):
             anchor_tag = " [anchor]" if anchor_norm and norm == anchor_norm else ""
-            print(f"  {i:02d}. {score:.2f} | {review:.2f} | {norm} | {text}{anchor_tag}")
+            review_tag = " ✓" if review > 0 else ""
+            print(f"  {i:02d}. {score:.2f} | {review:.2f}{review_tag} | {norm} | {text}{anchor_tag}")
 
         new_candidates = []
         for _, text, _, _ in selected:
@@ -537,7 +540,7 @@ for qi in range(MAX_SCAN):
     )
     print("init voted:", init_voted)
     if qtype not in YESNO_TYPES:
-        print("refined samples:")
+        print(f"refined samples (after TPO, pool_size={len(refined_texts)}):")
         for i, t in enumerate(refined_texts):
             print(f"  {i}: {t}")
         print("refined voted:", refined_voted)
