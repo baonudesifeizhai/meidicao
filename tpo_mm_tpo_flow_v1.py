@@ -3,6 +3,8 @@ import re
 import json
 from datetime import datetime
 
+import requests
+
 from datasets import load_dataset
 
 from tpo_mm_policy_v5 import (
@@ -48,6 +50,9 @@ REVIEW_MAX_TOKENS = 12
 SPECIFICITY_PENALTY_LOBE = 0.05
 SPECIFICITY_PENALTY_COMMA = 0.03
 SPECIFICITY_PENALTY_MAX = 0.15
+IMAGE_SUMMARY_ENABLED = True
+IMAGE_SUMMARY_MAX_TOKENS = 64
+IMAGE_SUMMARY_TEMPERATURE = 0.0
 
 MAX_QUESTIONS = 50
 MAX_SCAN = 400
@@ -195,6 +200,7 @@ REVIEWERS.append(
         "use_chat_template": True,
     }
 )
+HAS_TEXT_REVIEWER = any(cfg.get("type") == "hf" for cfg in REVIEWERS)
 
 
 def vote_texts(texts, qtype):
@@ -226,6 +232,32 @@ def _disagreement_stats(texts, qtype):
         "unknown_frac": unknown_frac,
         "counts": counts,
     }
+
+
+def _summarize_image_for_review(policy, image, question, qtype):
+    if image is None:
+        return None
+    focus = "key visual findings"
+    if qtype == "location":
+        focus = "anatomical locations and regions"
+    elif qtype == "disease":
+        focus = "abnormal findings or disease cues"
+    prompt = (
+        "You are a medical imaging assistant.\n"
+        f"Summarize ONLY {focus} visible in the image.\n"
+        "Do NOT answer the question. Do NOT guess.\n"
+        "If uncertain, output Unknown.\n"
+        "Output 1-3 short phrases separated by semicolons.\n"
+        f"Question: {question}"
+    )
+    summary = policy._ask_once_mm(
+        image,
+        prompt,
+        temperature=IMAGE_SUMMARY_TEMPERATURE,
+        max_tokens=IMAGE_SUMMARY_MAX_TOKENS,
+    )
+    summary = " ".join((summary or "").split()).strip()
+    return summary or None
 
 
 def _drop_unknown_if_possible(texts, qtype):
@@ -589,7 +621,16 @@ def _parse_choice(text, max_choice):
     return None
 
 
-def _review_scores_for_pool(reviewers, cache, question, qtype, pool_texts, rules, image=None):
+def _review_scores_for_pool(
+    reviewers,
+    cache,
+    question,
+    qtype,
+    pool_texts,
+    rules,
+    image=None,
+    image_summary=None,
+):
     if not reviewers or REVIEW_WEIGHT <= 0:
         return {}
     norm_to_text = {}
@@ -600,8 +641,11 @@ def _review_scores_for_pool(reviewers, cache, question, qtype, pool_texts, rules
     norms = list(norm_to_text.keys())
     if not norms:
         return {}
+
+    prompt_mm = None
+    prompt_text = None
     if image is not None:
-        prompt = (
+        prompt_mm = (
             "You are a medical QA evaluator. Choose the BEST and MOST ACCURATE answer among candidates.\n"
             "CRITICAL: Medical accuracy is the ONLY priority. Format and style are secondary.\n"
             "Carefully examine the image to verify which answer is medically correct.\n"
@@ -614,8 +658,31 @@ def _review_scores_for_pool(reviewers, cache, question, qtype, pool_texts, rules
             f"Question: {question}\n"
             "Candidates:\n"
         )
+        if image_summary:
+            prompt_text = (
+                "You are a medical QA evaluator. Choose the BEST and MOST ACCURATE answer among candidates.\n"
+                "CRITICAL: Medical accuracy is the ONLY priority. Format and style are secondary.\n"
+                "You do NOT have the image. Use ONLY the following image summary (it may be incomplete).\n"
+                f"Image summary: {image_summary}\n"
+                f"{rules}\n"
+                f"Question: {question}\n"
+                "Candidates:\n"
+            )
+        else:
+            prompt_text = (
+                "You are a medical QA evaluator. Choose the BEST and MOST ACCURATE answer among candidates.\n"
+                "CRITICAL: Medical accuracy is the ONLY priority. Format and style are secondary.\n"
+                "Pay close attention to:\n"
+                "- Anatomical details (left/right, specific locations, organ names)\n"
+                "- Disease names and medical terminology\n"
+                "- Semantic correctness\n"
+                "Do NOT use image evidence (image not available).\n"
+                f"{rules}\n"
+                f"Question: {question}\n"
+                "Candidates:\n"
+            )
     else:
-        prompt = (
+        prompt_text = (
             "You are a medical QA evaluator. Choose the BEST and MOST ACCURATE answer among candidates.\n"
             "CRITICAL: Medical accuracy is the ONLY priority. Format and style are secondary.\n"
             "Pay close attention to:\n"
@@ -627,26 +694,57 @@ def _review_scores_for_pool(reviewers, cache, question, qtype, pool_texts, rules
             f"Question: {question}\n"
             "Candidates:\n"
         )
+
     for i, text in enumerate(norm_to_text.values(), 1):
-        prompt += f"{i}. {text}\n"
-    prompt += "Return ONLY the number of the best answer."
+        if prompt_mm is not None:
+            prompt_mm += f"{i}. {text}\n"
+        if prompt_text is not None:
+            prompt_text += f"{i}. {text}\n"
+    if prompt_mm is not None:
+        prompt_mm += "Return ONLY the number of the best answer."
+    if prompt_text is not None:
+        prompt_text += "Return ONLY the number of the best answer."
+
     scores = {norm: 0.0 for norm in norms}
     weight_sum = 0.0
     for cfg, reviewer in reviewers:
-        key = (cfg["name"], qtype, question, tuple(norms), image is not None)
+        key = (cfg["name"], qtype, question, tuple(norms), image is not None, image_summary)
         if key not in cache:
+            used_summary = False
             try:
-                raw = reviewer.generate(prompt, image=image)
+                if image is not None and prompt_mm is not None:
+                    raw = reviewer.generate(prompt_mm, image=image)
+                else:
+                    raw = reviewer.generate(prompt_text, image=None)
             except NotImplementedError:
+                if prompt_text and image_summary:
+                    try:
+                        raw = reviewer.generate(prompt_text, image=None)
+                        used_summary = True
+                    except Exception:
+                        if REVIEW_DEBUG:
+                            print(f"  RM[{cfg['name']}] skipped (multimodal not supported)")
+                        continue
+                else:
+                    if REVIEW_DEBUG:
+                        print(f"  RM[{cfg['name']}] skipped (multimodal not supported)")
+                    continue
+            except requests.exceptions.RequestException as exc:
                 if REVIEW_DEBUG:
-                    print(f"  RM[{cfg['name']}] skipped (multimodal not supported)")
+                    print(f"  RM[{cfg['name']}] error={exc.__class__.__name__}: {exc} (skipped)")
+                cache[key] = None
                 continue
             choice = _parse_choice(raw, len(norms))
             if REVIEW_DEBUG:
                 raw_display = " ".join((raw or "").split())
                 choice_display = "None" if choice is None else str(choice)
                 picked = "None" if choice is None else norms[choice - 1]
-                img_tag = " [with image]" if image is not None else ""
+                if image is not None and not used_summary:
+                    img_tag = " [with image]"
+                elif image_summary:
+                    img_tag = " [summary]"
+                else:
+                    img_tag = ""
                 print(
                     f"  RM[{cfg['name']}] choice={choice_display} norm={picked} raw={raw_display!r}{img_tag}"
                 )
@@ -732,6 +830,7 @@ def tpo_optimize_text(
     reviewers=None,
     review_cache=None,
     image=None,
+    image_summary=None,
 ):
     pool = _drop_unknown_if_possible(candidates, qtype)
     rules, _ = rules_for(qtype)
@@ -758,7 +857,14 @@ def tpo_optimize_text(
         norm_pool = [normalize_answer(t, qtype) for t in pool]
         freq_map = Counter(norm_pool)
         review_scores = _review_scores_for_pool(
-            reviewers, review_cache, question, qtype, pool, rules, image=image
+            reviewers,
+            review_cache,
+            question,
+            qtype,
+            pool,
+            rules,
+            image=image,
+            image_summary=image_summary,
         )
         scored = []
         for t, n in zip(pool, norm_pool):
@@ -847,7 +953,14 @@ def tpo_optimize_text(
             norm_pool = [normalize_answer(t, qtype) for t in pool]
             freq_map = Counter(norm_pool)
             review_scores = _review_scores_for_pool(
-                reviewers, review_cache, question, qtype, pool, rules, image=image
+                reviewers,
+                review_cache,
+                question,
+                qtype,
+                pool,
+                rules,
+                image=image,
+                image_summary=image_summary,
             )
             scored = []
             for t, n in zip(pool, norm_pool):
@@ -1052,6 +1165,12 @@ for dataset_name, dataset_id, split in DATASETS:
                 if len(expanded_texts) > len(init_samples):
                     print(f"  [Candidate expansion: {len(init_samples)} -> {len(expanded_texts)}]")
 
+            image_summary = None
+            if IMAGE_SUMMARY_ENABLED and not skip_tpo and img is not None and HAS_TEXT_REVIEWER:
+                image_summary = _summarize_image_for_review(policy, img, q, qtype)
+                if REVIEW_DEBUG and image_summary:
+                    print(f"  [Image summary] {image_summary}")
+
             refined_texts = expanded_texts
             refined_voted = init_voted
             if qtype not in YESNO_TYPES and not skip_tpo:
@@ -1066,6 +1185,7 @@ for dataset_name, dataset_id, split in DATASETS:
                     reviewers=reviewer_policies,
                     review_cache=review_cache,
                     image=img,
+                    image_summary=image_summary,
                 )
 
             if qtype == "location":
