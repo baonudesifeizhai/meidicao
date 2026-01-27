@@ -163,7 +163,7 @@ class GenOut:
     qtype: str
 
 class VLLMOpenAIMMPolicyV5:
-    def __init__(self, base_url="http://localhost:8000/v1", model="medgemma-27b-it", api_key="dummy", timeout_s=180):
+    def __init__(self, base_url="http://localhost:8000/v1", model="google/medgemma-27b-it", api_key="dummy", timeout_s=180):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.headers = {"Content-Type":"application/json","Authorization":f"Bearer {api_key}"}

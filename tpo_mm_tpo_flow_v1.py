@@ -54,7 +54,7 @@ REVIEWERS = [
         "name": "medgemma",
         "type": "vllm",
         "base_url": "http://localhost:8000/v1",
-        "model": "medgemma-27b-it",
+        "model": "google/medgemma-27b-it",
         "weight": 1.0,
     },
     {
@@ -486,7 +486,7 @@ def final_verify(policy, image, question, qtype, best_answer):
 
 ds = load_dataset("mdwiratathya/SLAKE-vqa-english", split="test", streaming=True)
 it = iter(ds)
-policy = VLLMOpenAIMMPolicyV5("http://localhost:8000/v1", "medgemma-27b-it")
+policy = VLLMOpenAIMMPolicyV5("http://localhost:8000/v1", "google/medgemma-27b-it")
 reviewer_policies = build_reviewers(REVIEWERS)
 review_cache = {}
 
