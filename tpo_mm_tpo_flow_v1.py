@@ -1,5 +1,7 @@
 from collections import Counter
 import re
+import json
+from datetime import datetime
 
 from datasets import load_dataset
 
@@ -46,7 +48,7 @@ SPECIFICITY_PENALTY_LOBE = 0.15
 SPECIFICITY_PENALTY_COMMA = 0.08
 SPECIFICITY_PENALTY_MAX = 0.3
 
-MAX_QUESTIONS = 8
+MAX_QUESTIONS = 50
 MAX_SCAN = 400
 
 REVIEWERS = [
@@ -507,69 +509,159 @@ def final_verify(policy, image, question, qtype, best_answer):
     return policy._ask_once_mm(image, prompt, temperature=FINAL_TEMPERATURE, max_tokens=max_tokens)
 
 
-ds = load_dataset("mdwiratathya/SLAKE-vqa-english", split="test", streaming=True)
-it = iter(ds)
+# Load multiple datasets for paper experiments
+DATASETS = [
+    ("SLAKE", "mdwiratathya/SLAKE-vqa-english", "test"),
+    ("VQA-RAD", "flaviagiammarino/vqa-rad", "test"),
+    ("PathVQA", "flaviagiammarino/path-vqa", "test"),
+]
+
 policy = VLLMOpenAIMMPolicyV5("http://localhost:8000/v1", "google/medgemma-27b-it")
 reviewer_policies = build_reviewers(REVIEWERS)
-review_cache = {}
 
-seen = 0
+total_seen = 0
+dataset_stats = {name: {"seen": 0, "processed": 0} for name, _, _ in DATASETS}
+all_results = {name: [] for name, _, _ in DATASETS}
 
-for qi in range(MAX_SCAN):
-    ex = next(it)
-    img = ex["image"]
-    q = ex["question"]
-    gt = ex.get("answer", None)
-
-    qtype = classify_question(q)
-    if qtype in YESNO_TYPES or qtype not in TARGET_QTYPES:
-        continue
-    if qtype == "short" and not _is_ambiguous_short(q):
-        continue
-
-    init_out = policy.generate_n_mm(img, q, n=INIT_N, use_gate=True, temperature=1.2, top_p=0.85)
-    init_voted = init_out.voted
-    init_stats = _disagreement_stats(init_out.texts, qtype)
-    if init_stats["unique"] < MIN_UNIQUE or init_stats["disagree"] < MIN_DISAGREE:
-        continue
-
-    refined_texts = init_out.texts
-    refined_voted = init_voted
-    if qtype not in YESNO_TYPES:
-        refined_texts, refined_voted = tpo_optimize_text(
-            policy,
-            q,
-            qtype,
-            init_out.texts,
-            anchor_text=init_voted,
-            reviewers=reviewer_policies,
-            review_cache=review_cache,
-            image=img,
-        )
-
-    final_ans = final_verify(policy, img, q, qtype, refined_voted)
-
+for dataset_name, dataset_id, split in DATASETS:
     print("=" * 70)
-    print(f"[Q{qi}] type={qtype}")
-    print("Q :", q)
-    if gt is not None:
-        print("GT:", gt)
-    print("init samples:")
-    for i, t in enumerate(init_out.texts):
-        print(f"  {i}: {t}")
-    print(
-        f"init stats: unique={init_stats['unique']} "
-        f"disagree={init_stats['disagree']:.2f} "
-        f"unknown={init_stats['unknown_frac']:.2f}"
-    )
-    print("init voted:", init_voted)
-    if qtype not in YESNO_TYPES:
-        print(f"refined samples (after TPO, pool_size={len(refined_texts)}):")
-        for i, t in enumerate(refined_texts):
-            print(f"  {i}: {t}")
-        print("refined voted:", refined_voted)
-    print("final:", final_ans)
+    print(f"Processing dataset: {dataset_name} ({dataset_id})")
+    print("=" * 70)
+    
+    try:
+        ds = load_dataset(dataset_id, split=split, streaming=True)
+        it = iter(ds)
+        review_cache = {}
+        seen = 0
+        
+        for qi in range(MAX_SCAN):
+            try:
+                ex = next(it)
+            except StopIteration:
+                print(f"Dataset {dataset_name} exhausted at {qi} samples")
+                break
+            
+            # Handle different dataset formats
+            if dataset_name == "SLAKE":
+                img = ex["image"]
+                q = ex["question"]
+                gt = ex.get("answer", None)
+            elif dataset_name == "VQA-RAD":
+                img = ex["image"]
+                q = ex.get("question", ex.get("question_text", ""))
+                gt = ex.get("answer", None)
+            elif dataset_name == "PathVQA":
+                img = ex["image"]
+                q = ex.get("question", ex.get("question_text", ""))
+                gt = ex.get("answer", None)
+            else:
+                # Default format
+                img = ex["image"]
+                q = ex.get("question", ex.get("question_text", ""))
+                gt = ex.get("answer", None)
 
-    seen += 1
-    if seen >= MAX_QUESTIONS:
-        break
+            qtype = classify_question(q)
+            if qtype in YESNO_TYPES or qtype not in TARGET_QTYPES:
+                continue
+            if qtype == "short" and not _is_ambiguous_short(q):
+                continue
+
+            init_out = policy.generate_n_mm(img, q, n=INIT_N, use_gate=True, temperature=1.2, top_p=0.85)
+            init_voted = init_out.voted
+            init_stats = _disagreement_stats(init_out.texts, qtype)
+            if init_stats["unique"] < MIN_UNIQUE or init_stats["disagree"] < MIN_DISAGREE:
+                continue
+
+            refined_texts = init_out.texts
+            refined_voted = init_voted
+            if qtype not in YESNO_TYPES:
+                refined_texts, refined_voted = tpo_optimize_text(
+                    policy,
+                    q,
+                    qtype,
+                    init_out.texts,
+                    anchor_text=init_voted,
+                    reviewers=reviewer_policies,
+                    review_cache=review_cache,
+                    image=img,
+                )
+
+            final_ans = final_verify(policy, img, q, qtype, refined_voted)
+
+            print("=" * 70)
+            print(f"[{dataset_name}] Q{qi} type={qtype}")
+            print("Q :", q)
+            if gt is not None:
+                print("GT:", gt)
+            print("init samples:")
+            for i, t in enumerate(init_out.texts):
+                print(f"  {i}: {t}")
+            print(
+                f"init stats: unique={init_stats['unique']} "
+                f"disagree={init_stats['disagree']:.2f} "
+                f"unknown={init_stats['unknown_frac']:.2f}"
+            )
+            print("init voted:", init_voted)
+            if qtype not in YESNO_TYPES:
+                print(f"refined samples (after TPO, pool_size={len(refined_texts)}):")
+                for i, t in enumerate(refined_texts):
+                    print(f"  {i}: {t}")
+                print("refined voted:", refined_voted)
+            print("final:", final_ans)
+
+            # Save results for validation
+            result = {
+                "dataset": dataset_name,
+                "question_id": qi,
+                "question": q,
+                "question_type": qtype,
+                "ground_truth": gt,
+                "init_samples": init_out.texts,
+                "init_voted": init_voted,
+                "init_stats": {
+                    "unique": init_stats["unique"],
+                    "disagree": init_stats["disagree"],
+                    "unknown_frac": init_stats["unknown_frac"],
+                },
+                "refined_samples": refined_texts if qtype not in YESNO_TYPES else None,
+                "refined_voted": refined_voted if qtype not in YESNO_TYPES else None,
+                "final_answer": final_ans,
+            }
+            all_results[dataset_name].append(result)
+
+            seen += 1
+            dataset_stats[dataset_name]["processed"] += 1
+            total_seen += 1
+            
+            if seen >= MAX_QUESTIONS:
+                break
+        
+        dataset_stats[dataset_name]["seen"] = seen
+        print(f"\nDataset {dataset_name} completed: {seen} questions processed")
+        
+    except Exception as e:
+        print(f"Error processing dataset {dataset_name}: {e}")
+        import traceback
+        traceback.print_exc()
+        continue
+
+print("\n" + "=" * 70)
+print("SUMMARY: All datasets processed")
+print("=" * 70)
+for dataset_name, stats in dataset_stats.items():
+    print(f"{dataset_name}: {stats['processed']} questions processed")
+print(f"Total: {total_seen} questions processed across all datasets")
+
+# Save all results to JSON file for validation
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+output_file = f"tpo_results_{timestamp}.json"
+with open(output_file, "w", encoding="utf-8") as f:
+    json.dump({
+        "timestamp": timestamp,
+        "total_questions": total_seen,
+        "dataset_stats": dataset_stats,
+        "results": all_results,
+    }, f, indent=2, ensure_ascii=False)
+
+print(f"\nResults saved to: {output_file}")
+print("You can use this file for validation and evaluation.")
