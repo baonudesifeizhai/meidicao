@@ -66,6 +66,10 @@ CANDIDATE_BANK = {
         "Left lung",
         "Right lung",
         "Bilateral lungs",
+        "Both lungs",
+        "Left lung, Right lung",
+        "Right lung, Left lung",
+        "Left Lung, Right",
         "Left upper lobe",
         "Left lower lobe",
         "Right upper lobe",
@@ -264,6 +268,18 @@ def _dedup_candidates(texts, qtype):
     return out
 
 
+def _inject_bilateral_location(texts, qtype):
+    if qtype != "location":
+        return texts
+    norms = [normalize_answer(t, qtype) for t in texts]
+    has_left = "Left lung" in norms
+    has_right = "Right lung" in norms
+    has_bilateral = "Left Lung, Right" in norms
+    if has_left and has_right and not has_bilateral:
+        return list(texts) + ["Left Lung, Right"]
+    return texts
+
+
 def _select_bank_candidates(question, candidates, qtype):
     if not CANDIDATE_BANK_ENABLED:
         return []
@@ -311,6 +327,7 @@ def _expand_candidates(policy, image, question, qtype, existing):
         generated = _parse_candidate_lines(raw)
     bank = _select_bank_candidates(question, existing, qtype)
     merged = list(existing) + list(generated) + list(bank)
+    merged = _inject_bilateral_location(merged, qtype)
     merged = _drop_unknown_if_possible(merged, qtype)
     merged = _dedup_candidates(merged, qtype)
     if len(merged) > MAX_INIT_POOL:
@@ -596,6 +613,10 @@ def _score_candidate(
     unknown_penalty = UNKNOWN_PENALTY if norm == "Unknown" else 0.0
     # Never reward Unknown as anchor; it should be a fallback only.
     anchor_bonus = ANCHOR_BONUS if anchor_norm and norm == anchor_norm and norm != "Unknown" else 0.0
+    bilateral_bonus = 0.0
+    if qtype == "location" and norm == "Left Lung, Right":
+        if freq_map.get("Left lung", 0) > 0 and freq_map.get("Right lung", 0) > 0:
+            bilateral_bonus = 0.25
     # REMOVED: high consensus extra bonus - models can collectively be wrong
     # High consensus doesn't guarantee correctness
     new_norm_penalty = NEW_NORM_PENALTY if init_norms and norm not in init_norms else 0.0
@@ -603,6 +624,7 @@ def _score_candidate(
         fmt
         + (CONSENSUS_WEIGHT * freq)
         + anchor_bonus
+        + bilateral_bonus
         - unknown_penalty
         - new_norm_penalty
         - specificity_penalty
@@ -930,7 +952,7 @@ for dataset_name, dataset_id, split in DATASETS:
 
             # Use deterministic baseline answer as anchor, plus diverse samples for exploration.
             anchor_out = policy.generate_n_mm(img, q, n=1, use_gate=True, temperature=0.0, top_p=1.0)
-            anchor_text = anchor_out.texts[0] if anchor_out.texts else "Unknown"
+            anchor_text = anchor_out.voted if anchor_out.texts else "Unknown"
             if normalize_answer(anchor_text, qtype) == "Unknown":
                 forced = _force_non_unknown_answer(policy, img, q, qtype, tries=2)
                 if normalize_answer(forced, qtype) != "Unknown":

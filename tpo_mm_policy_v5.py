@@ -85,9 +85,23 @@ def normalize_yesno(s: str) -> str:
         return "No"
     return normalize_text(s)
 
+def normalize_location(s: str) -> str:
+    sl = (s or "").lower().strip()
+    sl = re.sub(r"[^a-z\s,/-]", " ", sl)
+    sl = re.sub(r"\s+", " ", sl).strip()
+    if not sl:
+        return "Unknown"
+    if "bilateral" in sl or "both lungs" in sl or "lungs bilaterally" in sl:
+        return "Left Lung, Right"
+    if "lung" in sl and "left" in sl and "right" in sl:
+        return "Left Lung, Right"
+    return normalize_text(s)
+
 def normalize_answer(s: str, qtype: str) -> str:
     if qtype == "modality":
         return normalize_modality(s)
+    if qtype == "location":
+        return normalize_location(s)
     if qtype in ("contain_yesno", "healthy_yesno", "abnormal_yesno"):
         return normalize_yesno(s)
     cleaned = _strip_leading_yesno(s)
