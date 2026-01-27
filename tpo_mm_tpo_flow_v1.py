@@ -33,15 +33,15 @@ INIT_N = 5
 POOL_SIZE = 10
 TOP_K = 3
 MUTATE_N = 2
-TPO_STEPS = 2
+TPO_STEPS = 2  # Reduced from 4: too many rounds can drift away from correct answers
 TPO_TEMPERATURE = 0.9
 TPO_TOP_P = 0.9
 FINAL_TEMPERATURE = 0.0
 CONSENSUS_WEIGHT = 0.5
-ANCHOR_BONUS = 0.4
+ANCHOR_BONUS = 0.7  # Increased: trust initial voted answer more
 NEW_NORM_PENALTY = 0.1
 UNKNOWN_PENALTY = 0.6
-REVIEW_WEIGHT = 0.6
+REVIEW_WEIGHT = 0.4  # Reduced: prevent reviewer from overriding correct anchor
 REVIEW_DEBUG = True
 REVIEW_MAX_TOKENS = 12
 SPECIFICITY_PENALTY_LOBE = 0.05
@@ -446,6 +446,18 @@ def tpo_optimize_text(
             )
             scored.append((score, t, n, review))
         scored.sort(key=lambda x: x[0], reverse=True)
+        
+        # Early stopping: if anchor is consistently the top answer, stop early
+        if anchor_norm and scored:
+            top_norm = scored[0][2]
+            if top_norm == anchor_norm and step > 0:
+                # Anchor is leading, check if it's significantly ahead
+                if len(scored) > 1:
+                    score_diff = scored[0][0] - scored[1][0]
+                    if score_diff > 0.3:  # Anchor is significantly ahead
+                        print(f"Early stopping at round {step + 1}: anchor answer is consistently leading")
+                        break
+        
         selected = _select_top_k(scored, TOP_K, anchor_norm)
 
         print(f"Round {step + 1} pool (score | review_score | norm | text):")
