@@ -37,11 +37,11 @@ TPO_STEPS = 2  # Reduced from 4: too many rounds can drift away from correct ans
 TPO_TEMPERATURE = 0.9
 TPO_TOP_P = 0.9
 FINAL_TEMPERATURE = 0.0
-CONSENSUS_WEIGHT = 0.4  # Moderate: consensus is useful but not decisive
-ANCHOR_BONUS = 1.5  # Very high: strongly protect initial voted answer
-NEW_NORM_PENALTY = 0.1  # Moderate: allow exploration but prefer initial answers
+CONSENSUS_WEIGHT = 0.3  # Reduced: prevent high consensus from overriding correct answers
+ANCHOR_BONUS = 1.2  # High but not too high: protect anchor but allow correction
+NEW_NORM_PENALTY = 0.05  # Reduced: allow more exploration of new answers
 UNKNOWN_PENALTY = 0.8  # Increased: strongly penalize Unknown
-REVIEW_WEIGHT = 0.3  # Moderate: reviewer can help but not override anchor
+REVIEW_WEIGHT = 0.4  # Increased: reviewer can help identify correct answers
 REVIEW_DEBUG = True
 REVIEW_MAX_TOKENS = 12
 SPECIFICITY_PENALTY_LOBE = 0.05
@@ -496,18 +496,30 @@ def tpo_optimize_text(
 
         new_candidates = []
         for _, text, _, _ in selected:
-            # Improved mutation: generate based on image and question
-            # This allows exploring potentially better answers while being conservative
+            # Aggressive mutation: generate diverse alternatives to explore better answers
+            # Use higher temperature and more candidates to explore different possibilities
             if image is not None:
-                # Use multimodal generation to explore better answers
-                # Generate fewer candidates per selected answer to be more conservative
+                # Use multimodal generation with higher diversity
                 mm_out = policy.generate_n_mm(
-                    image, question, n=min(MUTATE_N, 1), use_gate=True,  # Generate only 1 per selected to be conservative
-                    temperature=TPO_TEMPERATURE * 0.8, top_p=TPO_TOP_P  # Lower temperature for more conservative generation
+                    image, question, n=MUTATE_N, use_gate=True,
+                    temperature=TPO_TEMPERATURE * 1.2, top_p=TPO_TOP_P  # Higher temperature for more diversity
                 )
                 new_candidates.extend(mm_out.texts)
+                
+                # Also generate one "counter-example": explicitly try to find different answer
+                # Use multimodal generation with high diversity to explore alternatives
+                if step == 0:  # Only in first round to avoid too many candidates
+                    counter_mm_out = policy.generate_n_mm(
+                        image, question, n=1, use_gate=True,
+                        temperature=TPO_TEMPERATURE * 1.5, top_p=TPO_TOP_P  # Very high temperature for diversity
+                    )
+                    # Only add if it's different from the selected answer
+                    counter_norm = normalize_answer(counter_mm_out.texts[0], qtype) if counter_mm_out.texts else None
+                    selected_norm = normalize_answer(text, qtype)
+                    if counter_norm and counter_norm != selected_norm:
+                        new_candidates.extend(counter_mm_out.texts)
             else:
-                # Text-only: generate alternative based on question and rules
+                # Text-only: generate alternative with higher diversity
                 prompt = (
                     f"{rules}\n"
                     f"Question: {question}\n"
@@ -518,8 +530,8 @@ def tpo_optimize_text(
                 new_candidates.extend(
                     policy.generate_n_text(
                         prompt,
-                        n=min(MUTATE_N, 1),  # Generate only 1 per selected to be conservative
-                        temperature=TPO_TEMPERATURE * 0.8,  # Lower temperature
+                        n=MUTATE_N,
+                        temperature=TPO_TEMPERATURE * 1.2,  # Higher temperature
                         top_p=TPO_TOP_P,
                         max_tokens=32,
                     )
@@ -552,14 +564,26 @@ def tpo_optimize_text(
 
 
 def final_verify(policy, image, question, qtype, best_answer):
+    # Disabled or made very conservative: final_verify often makes answers worse
+    # If enabled, use very conservative settings
+    USE_FINAL_VERIFY = False  # Set to True to enable, but it often reduces accuracy
+    
+    if not USE_FINAL_VERIFY:
+        return best_answer  # Return as-is without verification
+    
     rules, max_tokens = rules_for(qtype)
     prompt = (
         f"{rules}\n"
         f"Question: {question}\n"
         f"Proposed answer: {best_answer}\n"
-        "Verify with the image and output only the answer."
+        "Verify with the image. If the proposed answer is correct, output it exactly. "
+        "Only change it if you are CERTAIN it is wrong. Output only the answer."
     )
-    return policy._ask_once_mm(image, prompt, temperature=FINAL_TEMPERATURE, max_tokens=max_tokens)
+    verified = policy._ask_once_mm(image, prompt, temperature=FINAL_TEMPERATURE, max_tokens=max_tokens)
+    # Only use verified answer if it's significantly different (to avoid minor changes)
+    if normalize_answer(verified, qtype) == normalize_answer(best_answer, qtype):
+        return best_answer  # No significant change, keep original
+    return verified
 
 
 def exact_match(pred, gt):
