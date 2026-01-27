@@ -387,7 +387,8 @@ def _score_candidate(
     fmt = _format_score(text, norm, qtype)
     specificity_penalty = _specificity_penalty(text, qtype)
     unknown_penalty = UNKNOWN_PENALTY if norm == "Unknown" else 0.0
-    anchor_bonus = ANCHOR_BONUS if anchor_norm and norm == anchor_norm else 0.0
+    # Never reward Unknown as anchor; it should be a fallback only.
+    anchor_bonus = ANCHOR_BONUS if anchor_norm and norm == anchor_norm and norm != "Unknown" else 0.0
     # REMOVED: high consensus extra bonus - models can collectively be wrong
     # High consensus doesn't guarantee correctness
     new_norm_penalty = NEW_NORM_PENALTY if init_norms and norm not in init_norms else 0.0
@@ -440,6 +441,10 @@ def tpo_optimize_text(
     if not anchor_text and candidates:
         anchor_text = candidates[0]
     anchor_norm = normalize_answer(anchor_text, qtype) if anchor_text else None
+    # If anchor is Unknown but other answers exist, do not force-keep Unknown.
+    if anchor_norm == "Unknown":
+        if any(normalize_answer(t, qtype) != "Unknown" for t in candidates):
+            anchor_norm = None
     review_cache = review_cache or {}
     
     # Check initial consensus: if anchor appears in 3+ out of 5 initial samples, it's likely correct
@@ -716,13 +721,18 @@ for dataset_name, dataset_id, split in DATASETS:
             if qtype == "short" and not _is_ambiguous_short(q):
                 continue
 
-            init_out = policy.generate_n_mm(img, q, n=INIT_N, use_gate=True, temperature=1.2, top_p=0.85)
-            init_voted = init_out.voted
-            init_stats = _disagreement_stats(init_out.texts, qtype)
+            # Use deterministic baseline answer as anchor, plus diverse samples for exploration.
+            anchor_out = policy.generate_n_mm(img, q, n=1, use_gate=True, temperature=0.0, top_p=1.0)
+            anchor_text = anchor_out.texts[0] if anchor_out.texts else "Unknown"
+            diverse_n = max(1, INIT_N - 1)
+            diverse_out = policy.generate_n_mm(img, q, n=diverse_n, use_gate=True, temperature=1.2, top_p=0.85)
+            init_texts = [anchor_text] + [t for t in diverse_out.texts if t]
+            init_voted = anchor_text
+            init_stats = _disagreement_stats(init_texts, qtype)
             if init_stats["unique"] < MIN_UNIQUE or init_stats["disagree"] < MIN_DISAGREE:
                 continue
 
-            refined_texts = init_out.texts
+            refined_texts = init_texts
             refined_voted = init_voted
             if qtype not in YESNO_TYPES:
                 # Use TPO for all questions to explore better answers
@@ -731,7 +741,7 @@ for dataset_name, dataset_id, split in DATASETS:
                     policy,
                     q,
                     qtype,
-                    init_out.texts,
+                    init_texts,
                     anchor_text=init_voted,
                     reviewers=reviewer_policies,
                     review_cache=review_cache,
@@ -746,7 +756,7 @@ for dataset_name, dataset_id, split in DATASETS:
             if gt is not None:
                 print("GT:", gt)
             print("init samples:")
-            for i, t in enumerate(init_out.texts):
+            for i, t in enumerate(init_texts):
                 print(f"  {i}: {t}")
             print(
                 f"init stats: unique={init_stats['unique']} "
@@ -768,7 +778,7 @@ for dataset_name, dataset_id, split in DATASETS:
                 "question": q,
                 "question_type": qtype,
                 "ground_truth": gt,
-                "init_samples": init_out.texts,
+                "init_samples": init_texts,
                 "init_voted": init_voted,
                 "init_stats": {
                     "unique": init_stats["unique"],
