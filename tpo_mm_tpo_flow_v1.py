@@ -9,6 +9,7 @@ from tpo_mm_policy_v5 import (
     VLLMOpenAIMMPolicyV5,
     classify_question,
     normalize_answer,
+    normalize_yesno,
     rules_for,
 )
 
@@ -333,6 +334,40 @@ def _expand_candidates(policy, image, question, qtype, existing):
     if len(merged) > MAX_INIT_POOL:
         merged = merged[:MAX_INIT_POOL]
     return merged
+
+
+def _needs_lung_check(question, candidates):
+    ql = (question or "").lower()
+    if "lung" in ql or "lobe" in ql:
+        return True
+    for t in candidates:
+        tl = (t or "").lower()
+        if "lung" in tl or "lobe" in tl:
+            return True
+    return False
+
+
+def _ask_yesno(policy, image, prompt):
+    raw = policy._ask_once_mm(image, prompt, temperature=0.0, max_tokens=3)
+    return normalize_yesno(raw)
+
+
+def _lung_side_override(policy, image, question, candidates):
+    if image is None:
+        return None
+    if not _needs_lung_check(question, candidates):
+        return None
+    left_q = "Is the abnormality present in the LEFT lung? Answer Yes or No."
+    right_q = "Is the abnormality present in the RIGHT lung? Answer Yes or No."
+    left = _ask_yesno(policy, image, left_q)
+    right = _ask_yesno(policy, image, right_q)
+    if left == "Yes" and right == "Yes":
+        return "Left Lung, Right"
+    if left == "Yes" and right != "Yes":
+        return "Left lung"
+    if right == "Yes" and left != "Yes":
+        return "Right lung"
+    return None
 
 def _format_score(text, norm, qtype):
     if qtype in YESNO_TYPES:
@@ -971,6 +1006,7 @@ for dataset_name, dataset_id, split in DATASETS:
             init_samples = list(init_texts)
             init_stats = _disagreement_stats(init_samples, qtype)
             skip_tpo = init_stats["unique"] < MIN_UNIQUE or init_stats["disagree"] < MIN_DISAGREE
+            tpo_used = qtype not in YESNO_TYPES and not skip_tpo
             if skip_tpo:
                 print(
                     f"  [Skipping TPO: low disagreement/unique "
@@ -997,6 +1033,12 @@ for dataset_name, dataset_id, split in DATASETS:
                     review_cache=review_cache,
                     image=img,
                 )
+
+            if qtype == "location":
+                override = _lung_side_override(policy, img, q, refined_texts)
+                if override:
+                    print(f"  [Lung side override: {override}]")
+                    refined_voted = override
 
             final_ans = final_verify(policy, img, q, qtype, refined_voted)
 
@@ -1027,6 +1069,8 @@ for dataset_name, dataset_id, split in DATASETS:
                 "question_id": qi,
                 "question": q,
                 "question_type": qtype,
+                "tpo_used": tpo_used,
+                "tpo_skipped": skip_tpo,
                 "ground_truth": gt,
                 "init_samples": init_samples,
                 "expanded_samples": expanded_texts,
@@ -1093,6 +1137,22 @@ if all_results_flat:
     print(f"  Exact match: {overall_metrics['exact_match']}/{overall_metrics['total']} ({overall_metrics['exact_match_rate']:.2%})")
     print(f"  Partial match: {overall_metrics['partial_match']}/{overall_metrics['total']} ({overall_metrics['partial_match_rate']:.2%})")
 
+    tpo_used_results = [r for r in all_results_flat if r.get("tpo_used")]
+    tpo_skipped_results = [r for r in all_results_flat if r.get("tpo_used") is False]
+
+    if tpo_used_results:
+        used_metrics = calculate_accuracy(tpo_used_results)
+        print(f"\nTPO-USED ONLY:")
+        print(f"  Total questions: {used_metrics['total']}")
+        print(f"  Exact match: {used_metrics['exact_match']}/{used_metrics['total']} ({used_metrics['exact_match_rate']:.2%})")
+        print(f"  Partial match: {used_metrics['partial_match']}/{used_metrics['total']} ({used_metrics['partial_match_rate']:.2%})")
+    if tpo_skipped_results:
+        skipped_metrics = calculate_accuracy(tpo_skipped_results)
+        print(f"\nTPO-SKIPPED (BASELINE) ONLY:")
+        print(f"  Total questions: {skipped_metrics['total']}")
+        print(f"  Exact match: {skipped_metrics['exact_match']}/{skipped_metrics['total']} ({skipped_metrics['exact_match_rate']:.2%})")
+        print(f"  Partial match: {skipped_metrics['partial_match']}/{skipped_metrics['total']} ({skipped_metrics['partial_match_rate']:.2%})")
+
 # Save all results to JSON file for validation
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 output_file = f"tpo_results_{timestamp}.json"
@@ -1105,6 +1165,10 @@ with open(output_file, "w", encoding="utf-8") as f:
         "dataset_stats": dataset_stats,
         "metrics": all_metrics,
         "overall_metrics": overall_metrics if all_results_flat else None,
+        "tpo_breakdown": {
+            "tpo_used": used_metrics if all_results_flat and tpo_used_results else None,
+            "tpo_skipped": skipped_metrics if all_results_flat and tpo_skipped_results else None,
+        },
         "results": all_results,
     }, f, indent=2, ensure_ascii=False)
 
