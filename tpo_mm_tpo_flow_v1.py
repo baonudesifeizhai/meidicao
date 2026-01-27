@@ -37,11 +37,11 @@ TPO_STEPS = 2  # Reduced from 4: too many rounds can drift away from correct ans
 TPO_TEMPERATURE = 0.9
 TPO_TOP_P = 0.9
 FINAL_TEMPERATURE = 0.0
-CONSENSUS_WEIGHT = 0.5
-ANCHOR_BONUS = 0.7  # Increased: trust initial voted answer more
-NEW_NORM_PENALTY = 0.1
+CONSENSUS_WEIGHT = 0.3  # Reduced: prevent high consensus from overriding anchor
+ANCHOR_BONUS = 1.2  # Significantly increased: strongly trust initial voted answer
+NEW_NORM_PENALTY = 0.15  # Increased: penalize answers not in initial set
 UNKNOWN_PENALTY = 0.6
-REVIEW_WEIGHT = 0.4  # Reduced: prevent reviewer from overriding correct anchor
+REVIEW_WEIGHT = 0.2  # Further reduced: reviewer often selects wrong detailed answers
 REVIEW_DEBUG = True
 REVIEW_MAX_TOKENS = 12
 SPECIFICITY_PENALTY_LOBE = 0.05
@@ -373,6 +373,7 @@ def _score_candidate(
     anchor_norm=None,
     init_norms=None,
     review_score=0.0,
+    high_consensus_anchor=False,
 ):
     norm = normalize_answer(text, qtype)
     freq = freq_map.get(norm, 0) / max(1, pool_size)
@@ -380,6 +381,9 @@ def _score_candidate(
     specificity_penalty = _specificity_penalty(text, qtype)
     unknown_penalty = UNKNOWN_PENALTY if norm == "Unknown" else 0.0
     anchor_bonus = ANCHOR_BONUS if anchor_norm and norm == anchor_norm else 0.0
+    # Extra protection for high-consensus anchor (appeared 3+ times in initial 5 samples)
+    if high_consensus_anchor and anchor_norm and norm == anchor_norm:
+        anchor_bonus += 0.5  # Additional 0.5 bonus for high-consensus anchor
     new_norm_penalty = NEW_NORM_PENALTY if init_norms and norm not in init_norms else 0.0
     return (
         fmt
@@ -431,6 +435,13 @@ def tpo_optimize_text(
         anchor_text = candidates[0]
     anchor_norm = normalize_answer(anchor_text, qtype) if anchor_text else None
     review_cache = review_cache or {}
+    
+    # Check initial consensus: if anchor appears in 3+ out of 5 initial samples, it's likely correct
+    init_norm_list = [normalize_answer(t, qtype) for t in candidates]
+    anchor_freq_in_init = init_norm_list.count(anchor_norm) if anchor_norm else 0
+    high_consensus_anchor = anchor_freq_in_init >= 3  # 3/5 = 60% consensus
+    if high_consensus_anchor and anchor_norm:
+        print(f"  [High consensus anchor: {anchor_norm} appears {anchor_freq_in_init}/5 times in initial samples]")
 
     for step in range(TPO_STEPS):
         norm_pool = [normalize_answer(t, qtype) for t in pool]
@@ -442,7 +453,8 @@ def tpo_optimize_text(
         for t, n in zip(pool, norm_pool):
             review = review_scores.get(n, 0.0)
             score = _score_candidate(
-                t, qtype, freq_map, len(pool), anchor_norm, init_norms, review
+                t, qtype, freq_map, len(pool), anchor_norm, init_norms, review,
+                high_consensus_anchor=high_consensus_anchor
             )
             scored.append((score, t, n, review))
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -506,7 +518,8 @@ def tpo_optimize_text(
             for t, n in zip(pool, norm_pool):
                 review = review_scores.get(n, 0.0)
                 score = _score_candidate(
-                    t, qtype, freq_map, len(pool), anchor_norm, init_norms, review
+                    t, qtype, freq_map, len(pool), anchor_norm, init_norms, review,
+                    high_consensus_anchor=high_consensus_anchor
                 )
                 scored.append((score, t, n, review))
             scored.sort(key=lambda x: x[0], reverse=True)
