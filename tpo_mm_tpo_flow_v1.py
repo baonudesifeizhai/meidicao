@@ -162,7 +162,7 @@ def _is_lung_related(question, candidates=None):
             return True
     return False
 
-USE_QWEN_REVIEWER = True  # Set False to disable Qwen2.5-VL reviewer
+USE_QWEN_REVIEWER = False  # Set True to enable Qwen2.5-VL reviewer
 
 REVIEWERS = [
     {
