@@ -133,6 +133,34 @@ _STOPWORDS = {
     "where", "what", "which", "location", "located", "abnormality", "abnormalities",
     "main", "largest", "biggest", "most", "primary", "dominant",
 }
+_LUNG_KEYWORDS = {
+    "lung",
+    "lobe",
+    "pulmonary",
+    "pleural",
+    "hemithorax",
+    "costophrenic",
+    "hilum",
+    "apex",
+    "apical",
+    "bronch",
+    "alveol",
+    "pneumo",
+}
+
+
+def _contains_lung_keywords(text):
+    tl = (text or "").lower()
+    return any(k in tl for k in _LUNG_KEYWORDS)
+
+
+def _is_lung_related(question, candidates=None):
+    if _contains_lung_keywords(question):
+        return True
+    for t in candidates or []:
+        if _contains_lung_keywords(t):
+            return True
+    return False
 
 REVIEWERS = [
     {
@@ -269,8 +297,10 @@ def _dedup_candidates(texts, qtype):
     return out
 
 
-def _inject_bilateral_location(texts, qtype):
+def _inject_bilateral_location(texts, qtype, question=None):
     if qtype != "location":
+        return texts
+    if not _is_lung_related(question, texts):
         return texts
     norms = [normalize_answer(t, qtype) for t in texts]
     has_left = "Left lung" in norms
@@ -293,8 +323,12 @@ def _select_bank_candidates(question, candidates, qtype):
     tokens = {t for t in tokens if t not in _STOPWORDS}
     if tokens:
         filtered = [b for b in bank if any(tok in b.lower() for tok in tokens)]
+        if qtype == "location":
+            return filtered[:CANDIDATE_BANK_MAX]
         if len(filtered) >= 5:
             return filtered[:CANDIDATE_BANK_MAX]
+    if qtype == "location":
+        return []
     return bank[:CANDIDATE_BANK_MAX]
 
 
@@ -328,7 +362,7 @@ def _expand_candidates(policy, image, question, qtype, existing):
         generated = _parse_candidate_lines(raw)
     bank = _select_bank_candidates(question, existing, qtype)
     merged = list(existing) + list(generated) + list(bank)
-    merged = _inject_bilateral_location(merged, qtype)
+    merged = _inject_bilateral_location(merged, qtype, question=question)
     merged = _drop_unknown_if_possible(merged, qtype)
     merged = _dedup_candidates(merged, qtype)
     if len(merged) > MAX_INIT_POOL:
@@ -337,14 +371,7 @@ def _expand_candidates(policy, image, question, qtype, existing):
 
 
 def _needs_lung_check(question, candidates):
-    ql = (question or "").lower()
-    if "lung" in ql or "lobe" in ql:
-        return True
-    for t in candidates:
-        tl = (t or "").lower()
-        if "lung" in tl or "lobe" in tl:
-            return True
-    return False
+    return _is_lung_related(question, candidates)
 
 
 def _ask_yesno(policy, image, prompt):
@@ -1035,7 +1062,7 @@ for dataset_name, dataset_id, split in DATASETS:
                 )
 
             if qtype == "location":
-                override = _lung_side_override(policy, img, q, refined_texts)
+                override = _lung_side_override(policy, img, q, init_samples)
                 if override:
                     print(f"  [Lung side override: {override}]")
                     refined_voted = override
