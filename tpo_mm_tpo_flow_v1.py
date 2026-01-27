@@ -509,6 +509,79 @@ def final_verify(policy, image, question, qtype, best_answer):
     return policy._ask_once_mm(image, prompt, temperature=FINAL_TEMPERATURE, max_tokens=max_tokens)
 
 
+def exact_match(pred, gt):
+    """Exact match after normalization"""
+    if not pred or not gt:
+        return False
+    pred_norm = pred.strip().lower()
+    gt_norm = gt.strip().lower()
+    return pred_norm == gt_norm
+
+
+def partial_match(pred, gt):
+    """Check if prediction contains ground truth or vice versa"""
+    if not pred or not gt:
+        return False
+    pred_lower = pred.strip().lower()
+    gt_lower = gt.strip().lower()
+    
+    # Check if pred contains gt or gt contains pred
+    if gt_lower in pred_lower or pred_lower in gt_lower:
+        return True
+    
+    # Check for comma-separated values
+    gt_parts = [p.strip() for p in gt_lower.split(",")]
+    pred_parts = [p.strip() for p in pred_lower.split(",")]
+    
+    # Check if any part matches
+    for gt_part in gt_parts:
+        for pred_part in pred_parts:
+            if gt_part in pred_part or pred_part in gt_part:
+                return True
+    
+    return False
+
+
+def calculate_accuracy(results):
+    """Calculate accuracy metrics"""
+    total = len(results)
+    if total == 0:
+        return {}
+    
+    exact_matches = sum(1 for r in results if exact_match(r["final_answer"], r["ground_truth"]))
+    partial_matches = sum(1 for r in results if partial_match(r["final_answer"], r["ground_truth"]))
+    
+    # Per question type
+    by_type = {}
+    for r in results:
+        qtype = r.get("question_type", "unknown")
+        if qtype not in by_type:
+            by_type[qtype] = {"total": 0, "exact": 0, "partial": 0}
+        by_type[qtype]["total"] += 1
+        if exact_match(r["final_answer"], r["ground_truth"]):
+            by_type[qtype]["exact"] += 1
+        if partial_match(r["final_answer"], r["ground_truth"]):
+            by_type[qtype]["partial"] += 1
+    
+    metrics = {
+        "total": total,
+        "exact_match": exact_matches,
+        "exact_match_rate": exact_matches / total if total > 0 else 0.0,
+        "partial_match": partial_matches,
+        "partial_match_rate": partial_matches / total if total > 0 else 0.0,
+        "by_type": {
+            qtype: {
+                "total": stats["total"],
+                "exact_match_rate": stats["exact"] / stats["total"] if stats["total"] > 0 else 0.0,
+                "partial_match_rate": stats["partial"] / stats["total"] if stats["total"] > 0 else 0.0,
+            }
+            for qtype, stats in by_type.items()
+        }
+    }
+    
+    return metrics
+
+
 # Load multiple datasets for paper experiments
 DATASETS = [
     ("SLAKE", "mdwiratathya/SLAKE-vqa-english", "test"),
@@ -626,6 +699,8 @@ for dataset_name, dataset_id, split in DATASETS:
                 "refined_samples": refined_texts if qtype not in YESNO_TYPES else None,
                 "refined_voted": refined_voted if qtype not in YESNO_TYPES else None,
                 "final_answer": final_ans,
+                "exact_match": exact_match(final_ans, gt) if gt else None,
+                "partial_match": partial_match(final_ans, gt) if gt else None,
             }
             all_results[dataset_name].append(result)
 
@@ -646,11 +721,37 @@ for dataset_name, dataset_id, split in DATASETS:
         continue
 
 print("\n" + "=" * 70)
-print("SUMMARY: All datasets processed")
+print("TPO EVALUATION RESULTS")
 print("=" * 70)
-for dataset_name, stats in dataset_stats.items():
-    print(f"{dataset_name}: {stats['processed']} questions processed")
-print(f"Total: {total_seen} questions processed across all datasets")
+
+# Calculate metrics
+all_metrics = {}
+for dataset_name in DATASETS:
+    dataset_name = dataset_name[0]
+    if all_results[dataset_name]:
+        metrics = calculate_accuracy(all_results[dataset_name])
+        all_metrics[dataset_name] = metrics
+        
+        print(f"\n{dataset_name}:")
+        print(f"  Total questions: {metrics['total']}")
+        print(f"  Exact match: {metrics['exact_match']}/{metrics['total']} ({metrics['exact_match_rate']:.2%})")
+        print(f"  Partial match: {metrics['partial_match']}/{metrics['total']} ({metrics['partial_match_rate']:.2%})")
+        print(f"  By question type:")
+        for qtype, type_stats in metrics['by_type'].items():
+            print(f"    {qtype}: {type_stats['exact_match_rate']:.2%} exact, {type_stats['partial_match_rate']:.2%} partial")
+
+# Overall metrics
+all_results_flat = []
+for dataset_name in DATASETS:
+    dataset_name = dataset_name[0]
+    all_results_flat.extend(all_results[dataset_name])
+
+if all_results_flat:
+    overall_metrics = calculate_accuracy(all_results_flat)
+    print(f"\nOVERALL:")
+    print(f"  Total questions: {overall_metrics['total']}")
+    print(f"  Exact match: {overall_metrics['exact_match']}/{overall_metrics['total']} ({overall_metrics['exact_match_rate']:.2%})")
+    print(f"  Partial match: {overall_metrics['partial_match']}/{overall_metrics['total']} ({overall_metrics['partial_match_rate']:.2%})")
 
 # Save all results to JSON file for validation
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -658,8 +759,12 @@ output_file = f"tpo_results_{timestamp}.json"
 with open(output_file, "w", encoding="utf-8") as f:
     json.dump({
         "timestamp": timestamp,
+        "model": "google/medgemma-27b-it",
+        "method": "TPO_optimized",
         "total_questions": total_seen,
         "dataset_stats": dataset_stats,
+        "metrics": all_metrics,
+        "overall_metrics": overall_metrics if all_results_flat else None,
         "results": all_results,
     }, f, indent=2, ensure_ascii=False)
 
