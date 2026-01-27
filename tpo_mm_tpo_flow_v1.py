@@ -373,7 +373,7 @@ def _score_candidate(
     anchor_norm=None,
     init_norms=None,
     review_score=0.0,
-    high_consensus_anchor=False,
+    high_consensus_anchor=False,  # Kept for compatibility but not used
 ):
     norm = normalize_answer(text, qtype)
     freq = freq_map.get(norm, 0) / max(1, pool_size)
@@ -381,9 +381,8 @@ def _score_candidate(
     specificity_penalty = _specificity_penalty(text, qtype)
     unknown_penalty = UNKNOWN_PENALTY if norm == "Unknown" else 0.0
     anchor_bonus = ANCHOR_BONUS if anchor_norm and norm == anchor_norm else 0.0
-    # Extra protection for high-consensus anchor (appeared 3+ times in initial 5 samples)
-    if high_consensus_anchor and anchor_norm and norm == anchor_norm:
-        anchor_bonus += 0.5  # Additional 0.5 bonus for high-consensus anchor
+    # REMOVED: high consensus extra bonus - models can collectively be wrong
+    # High consensus doesn't guarantee correctness
     new_norm_penalty = NEW_NORM_PENALTY if init_norms and norm not in init_norms else 0.0
     return (
         fmt
@@ -437,11 +436,13 @@ def tpo_optimize_text(
     review_cache = review_cache or {}
     
     # Check initial consensus: if anchor appears in 3+ out of 5 initial samples, it's likely correct
+    # BUT: high consensus doesn't guarantee correctness (models can collectively be wrong)
+    # So we use this only for early stopping, not for extra bonus
     init_norm_list = [normalize_answer(t, qtype) for t in candidates]
     anchor_freq_in_init = init_norm_list.count(anchor_norm) if anchor_norm else 0
     high_consensus_anchor = anchor_freq_in_init >= 3  # 3/5 = 60% consensus
-    if high_consensus_anchor and anchor_norm:
-        print(f"  [High consensus anchor: {anchor_norm} appears {anchor_freq_in_init}/5 times in initial samples]")
+    # REMOVED: high consensus bonus - models can collectively be wrong
+    # Instead, we'll use early stopping if anchor is consistently leading
 
     for step in range(TPO_STEPS):
         norm_pool = [normalize_answer(t, qtype) for t in pool]
@@ -681,16 +682,26 @@ for dataset_name, dataset_id, split in DATASETS:
             refined_texts = init_out.texts
             refined_voted = init_voted
             if qtype not in YESNO_TYPES:
-                refined_texts, refined_voted = tpo_optimize_text(
-                    policy,
-                    q,
-                    qtype,
-                    init_out.texts,
-                    anchor_text=init_voted,
-                    reviewers=reviewer_policies,
-                    review_cache=review_cache,
-                    image=img,
-                )
+                # Only use TPO if initial answers are uncertain (low consensus)
+                # High consensus doesn't guarantee correctness, but low consensus suggests uncertainty
+                init_norm_list = [normalize_answer(t, qtype) for t in init_out.texts]
+                anchor_freq = init_norm_list.count(normalize_answer(init_voted, qtype))
+                use_tpo = anchor_freq < 4  # Use TPO if anchor appears < 4/5 times (less than 80% consensus)
+                
+                if use_tpo:
+                    refined_texts, refined_voted = tpo_optimize_text(
+                        policy,
+                        q,
+                        qtype,
+                        init_out.texts,
+                        anchor_text=init_voted,
+                        reviewers=reviewer_policies,
+                        review_cache=review_cache,
+                        image=img,
+                    )
+                else:
+                    # High consensus: skip TPO to avoid over-optimization
+                    print(f"  [Skipping TPO: high initial consensus ({anchor_freq}/5)]")
 
             final_ans = final_verify(policy, img, q, qtype, refined_voted)
 
