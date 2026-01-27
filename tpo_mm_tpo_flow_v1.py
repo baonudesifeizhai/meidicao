@@ -70,7 +70,7 @@ REVIEWERS = [
         "model": "BioMistral/BioMistral-7B",
         "weight": 1.0,
         "dtype": "bfloat16",
-        "device_map": "auto",
+        "device_map": {"": "cuda:3"},
         "trust_remote_code": False,
         "use_chat_template": True,
     },
@@ -417,7 +417,7 @@ def tpo_optimize_text(
         selected = _select_top_k(scored, TOP_K, anchor_norm)
 
         print(f"Round {step + 1} pool (score | review_score | norm | text):")
-        print(f"  Note: review_score = reviewer投票权重 (0.0=未选中, >0=被选中)")
+        print(f"  Note: review_score = reviewer voting weight (0.0=not selected, >0=selected)")
         for i, (score, text, norm, review) in enumerate(scored, 1):
             anchor_tag = " [anchor]" if anchor_norm and norm == anchor_norm else ""
             review_tag = " ✓" if review > 0 else ""
