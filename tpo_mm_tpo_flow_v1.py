@@ -149,10 +149,15 @@ class VLLMReviewer:
     def __init__(self, base_url, model):
         self.policy = VLLMOpenAIMMPolicyV5(base_url, model)
 
-    def generate(self, prompt):
-        return self.policy.generate_n_text(
-            prompt, n=1, temperature=0.0, top_p=1.0, max_tokens=REVIEW_MAX_TOKENS
-        )[0]
+    def generate(self, prompt, image=None):
+        if image is not None:
+            return self.policy._ask_once_mm(
+                image, prompt, temperature=0.0, max_tokens=REVIEW_MAX_TOKENS
+            )
+        else:
+            return self.policy.generate_n_text(
+                prompt, n=1, temperature=0.0, top_p=1.0, max_tokens=REVIEW_MAX_TOKENS
+            )[0]
 
 
 class HFReviewer:
@@ -206,7 +211,9 @@ class HFReviewer:
             )
         self._model.eval()
 
-    def generate(self, prompt):
+    def generate(self, prompt, image=None):
+        if image is not None:
+            raise NotImplementedError("HFReviewer does not support multimodal input. Use VLLMReviewer for image-based review.")
         if self._model is None or self._tokenizer is None:
             self._load()
         import torch
@@ -284,7 +291,7 @@ def _parse_choice(text, max_choice):
     return None
 
 
-def _review_scores_for_pool(reviewers, cache, question, qtype, pool_texts, rules):
+def _review_scores_for_pool(reviewers, cache, question, qtype, pool_texts, rules, image=None):
     if not reviewers or REVIEW_WEIGHT <= 0:
         return {}
     norm_to_text = {}
@@ -295,29 +302,44 @@ def _review_scores_for_pool(reviewers, cache, question, qtype, pool_texts, rules
     norms = list(norm_to_text.keys())
     if not norms:
         return {}
-    prompt = (
-        "You are a medical QA evaluator. Choose the best answer among candidates.\n"
-        "Consider format compliance and semantic relevance. Do NOT use image evidence.\n"
-        f"{rules}\n"
-        f"Question: {question}\n"
-        "Candidates:\n"
-    )
+    if image is not None:
+        prompt = (
+            "You are a medical QA evaluator. Choose the best answer among candidates.\n"
+            "Consider format compliance, semantic relevance, and image evidence.\n"
+            f"{rules}\n"
+            f"Question: {question}\n"
+            "Candidates:\n"
+        )
+    else:
+        prompt = (
+            "You are a medical QA evaluator. Choose the best answer among candidates.\n"
+            "Consider format compliance and semantic relevance. Do NOT use image evidence.\n"
+            f"{rules}\n"
+            f"Question: {question}\n"
+            "Candidates:\n"
+        )
     for i, text in enumerate(norm_to_text.values(), 1):
         prompt += f"{i}. {text}\n"
     prompt += "Return ONLY the number of the best answer."
     scores = {norm: 0.0 for norm in norms}
     weight_sum = 0.0
     for cfg, reviewer in reviewers:
-        key = (cfg["name"], qtype, question, tuple(norms))
+        key = (cfg["name"], qtype, question, tuple(norms), image is not None)
         if key not in cache:
-            raw = reviewer.generate(prompt)
+            try:
+                raw = reviewer.generate(prompt, image=image)
+            except NotImplementedError:
+                if REVIEW_DEBUG:
+                    print(f"  RM[{cfg['name']}] skipped (multimodal not supported)")
+                continue
             choice = _parse_choice(raw, len(norms))
             if REVIEW_DEBUG:
                 raw_display = " ".join((raw or "").split())
                 choice_display = "None" if choice is None else str(choice)
                 picked = "None" if choice is None else norms[choice - 1]
+                img_tag = " [with image]" if image is not None else ""
                 print(
-                    f"  RM[{cfg['name']}] choice={choice_display} norm={picked} raw={raw_display!r}"
+                    f"  RM[{cfg['name']}] choice={choice_display} norm={picked} raw={raw_display!r}{img_tag}"
                 )
             cache[key] = choice
         cached = cache.get(key)
@@ -391,6 +413,7 @@ def tpo_optimize_text(
     anchor_text=None,
     reviewers=None,
     review_cache=None,
+    image=None,
 ):
     pool = candidates[:]
     rules, _ = rules_for(qtype)
@@ -404,7 +427,7 @@ def tpo_optimize_text(
         norm_pool = [normalize_answer(t, qtype) for t in pool]
         freq_map = Counter(norm_pool)
         review_scores = _review_scores_for_pool(
-            reviewers, review_cache, question, qtype, pool, rules
+            reviewers, review_cache, question, qtype, pool, rules, image=image
         )
         scored = []
         for t, n in zip(pool, norm_pool):
@@ -455,7 +478,7 @@ def tpo_optimize_text(
             norm_pool = [normalize_answer(t, qtype) for t in pool]
             freq_map = Counter(norm_pool)
             review_scores = _review_scores_for_pool(
-                reviewers, review_cache, question, qtype, pool, rules
+                reviewers, review_cache, question, qtype, pool, rules, image=image
             )
             scored = []
             for t, n in zip(pool, norm_pool):
@@ -521,6 +544,7 @@ for qi in range(MAX_SCAN):
             anchor_text=init_voted,
             reviewers=reviewer_policies,
             review_cache=review_cache,
+            image=img,
         )
 
     final_ans = final_verify(policy, img, q, qtype, refined_voted)
