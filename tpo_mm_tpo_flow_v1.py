@@ -61,7 +61,7 @@ REVIEWERS = [
         "name": "qwen2.5-14b",
         "type": "vllm",
         "base_url": "http://localhost:8001/v1",
-        "model": "Qwen2.5-14B-Instruct",
+        "model": "Qwen/Qwen2.5-14B-Instruct",
         "weight": 1.0,
     },
     {
