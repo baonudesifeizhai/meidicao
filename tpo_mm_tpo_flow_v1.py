@@ -37,11 +37,11 @@ TPO_STEPS = 2  # Reduced from 4: too many rounds can drift away from correct ans
 TPO_TEMPERATURE = 0.9
 TPO_TOP_P = 0.9
 FINAL_TEMPERATURE = 0.0
-CONSENSUS_WEIGHT = 0.3  # Reduced: prevent high consensus from overriding anchor
-ANCHOR_BONUS = 1.2  # Significantly increased: strongly trust initial voted answer
-NEW_NORM_PENALTY = 0.15  # Increased: penalize answers not in initial set
-UNKNOWN_PENALTY = 0.6
-REVIEW_WEIGHT = 0.2  # Further reduced: reviewer often selects wrong detailed answers
+CONSENSUS_WEIGHT = 0.4  # Moderate: consensus is useful but not decisive
+ANCHOR_BONUS = 1.5  # Very high: strongly protect initial voted answer
+NEW_NORM_PENALTY = 0.1  # Moderate: allow exploration but prefer initial answers
+UNKNOWN_PENALTY = 0.8  # Increased: strongly penalize Unknown
+REVIEW_WEIGHT = 0.3  # Moderate: reviewer can help but not override anchor
 REVIEW_DEBUG = True
 REVIEW_MAX_TOKENS = 12
 SPECIFICITY_PENALTY_LOBE = 0.05
@@ -309,20 +309,27 @@ def _review_scores_for_pool(reviewers, cache, question, qtype, pool_texts, rules
         return {}
     if image is not None:
         prompt = (
-            "You are a medical QA evaluator. Choose the best answer among candidates.\n"
-            "Priority: Medical accuracy > Format compliance > Semantic relevance.\n"
-            "Use image evidence to verify which answer is most medically accurate.\n"
-            "Pay attention to anatomical details (left/right, specific locations, disease names).\n"
+            "You are a medical QA evaluator. Choose the BEST and MOST ACCURATE answer among candidates.\n"
+            "CRITICAL: Medical accuracy is the ONLY priority. Format and style are secondary.\n"
+            "Carefully examine the image to verify which answer is medically correct.\n"
+            "Pay close attention to:\n"
+            "- Anatomical details (left/right, specific locations, organ names)\n"
+            "- Disease names and medical terminology\n"
+            "- Spatial relationships in the image\n"
+            "If multiple answers are medically plausible, choose the one that best matches the image evidence.\n"
             f"{rules}\n"
             f"Question: {question}\n"
             "Candidates:\n"
         )
     else:
         prompt = (
-            "You are a medical QA evaluator. Choose the best answer among candidates.\n"
-            "Priority: Medical accuracy > Format compliance > Semantic relevance.\n"
-            "Pay attention to anatomical details (left/right, specific locations, disease names).\n"
-            "Do NOT use image evidence.\n"
+            "You are a medical QA evaluator. Choose the BEST and MOST ACCURATE answer among candidates.\n"
+            "CRITICAL: Medical accuracy is the ONLY priority. Format and style are secondary.\n"
+            "Pay close attention to:\n"
+            "- Anatomical details (left/right, specific locations, organ names)\n"
+            "- Disease names and medical terminology\n"
+            "- Semantic correctness\n"
+            "Do NOT use image evidence (image not available).\n"
             f"{rules}\n"
             f"Question: {question}\n"
             "Candidates:\n"
@@ -460,15 +467,17 @@ def tpo_optimize_text(
             scored.append((score, t, n, review))
         scored.sort(key=lambda x: x[0], reverse=True)
         
-        # Early stopping: if anchor is consistently the top answer, stop early
+        # Early stopping: if anchor is consistently the top answer with large margin, stop early
         if anchor_norm and scored:
             top_norm = scored[0][2]
             if top_norm == anchor_norm and step > 0:
                 # Anchor is leading, check if it's significantly ahead
                 if len(scored) > 1:
                     score_diff = scored[0][0] - scored[1][0]
-                    if score_diff > 0.3:  # Anchor is significantly ahead
-                        print(f"Early stopping at round {step + 1}: anchor answer is consistently leading")
+                    # More conservative: only stop if anchor is very far ahead (0.5+)
+                    # This allows TPO to explore even when anchor is slightly ahead
+                    if score_diff > 0.5:  # Anchor is very significantly ahead
+                        print(f"Early stopping at round {step + 1}: anchor answer is very significantly leading (diff={score_diff:.2f})")
                         break
         
         selected = _select_top_k(scored, TOP_K, anchor_norm)
@@ -487,24 +496,34 @@ def tpo_optimize_text(
 
         new_candidates = []
         for _, text, _, _ in selected:
-            prompt = (
-                f"{rules}\n"
-                f"Question: {question}\n"
-                f"Candidate answer: {text}\n"
-                "Generate a concise alternative answer in the required format. "
-                "The alternative should be medically plausible and accurate. "
-                "If the candidate is already accurate, generate a similar but slightly different formulation. "
-                "Output only the answer."
-            )
-            new_candidates.extend(
-                policy.generate_n_text(
-                    prompt,
-                    n=MUTATE_N,
-                    temperature=TPO_TEMPERATURE,
-                    top_p=TPO_TOP_P,
-                    max_tokens=32,
+            # Improved mutation: generate based on image and question
+            # This allows exploring potentially better answers while being conservative
+            if image is not None:
+                # Use multimodal generation to explore better answers
+                # Generate fewer candidates per selected answer to be more conservative
+                mm_out = policy.generate_n_mm(
+                    image, question, n=min(MUTATE_N, 1), use_gate=True,  # Generate only 1 per selected to be conservative
+                    temperature=TPO_TEMPERATURE * 0.8, top_p=TPO_TOP_P  # Lower temperature for more conservative generation
                 )
-            )
+                new_candidates.extend(mm_out.texts)
+            else:
+                # Text-only: generate alternative based on question and rules
+                prompt = (
+                    f"{rules}\n"
+                    f"Question: {question}\n"
+                    "Generate a concise answer in the required format. "
+                    "The answer should be medically accurate and plausible. "
+                    "Output only the answer."
+                )
+                new_candidates.extend(
+                    policy.generate_n_text(
+                        prompt,
+                        n=min(MUTATE_N, 1),  # Generate only 1 per selected to be conservative
+                        temperature=TPO_TEMPERATURE * 0.8,  # Lower temperature
+                        top_p=TPO_TOP_P,
+                        max_tokens=32,
+                    )
+                )
 
         pool = [t for _, t, _, _ in selected] + new_candidates
         if anchor_text and anchor_norm and all(normalize_answer(t, qtype) != anchor_norm for t in pool):
@@ -682,26 +701,18 @@ for dataset_name, dataset_id, split in DATASETS:
             refined_texts = init_out.texts
             refined_voted = init_voted
             if qtype not in YESNO_TYPES:
-                # Only use TPO if initial answers are uncertain (low consensus)
-                # High consensus doesn't guarantee correctness, but low consensus suggests uncertainty
-                init_norm_list = [normalize_answer(t, qtype) for t in init_out.texts]
-                anchor_freq = init_norm_list.count(normalize_answer(init_voted, qtype))
-                use_tpo = anchor_freq < 4  # Use TPO if anchor appears < 4/5 times (less than 80% consensus)
-                
-                if use_tpo:
-                    refined_texts, refined_voted = tpo_optimize_text(
-                        policy,
-                        q,
-                        qtype,
-                        init_out.texts,
-                        anchor_text=init_voted,
-                        reviewers=reviewer_policies,
-                        review_cache=review_cache,
-                        image=img,
-                    )
-                else:
-                    # High consensus: skip TPO to avoid over-optimization
-                    print(f"  [Skipping TPO: high initial consensus ({anchor_freq}/5)]")
+                # Use TPO for all questions to explore better answers
+                # But be conservative: strongly protect the initial voted answer
+                refined_texts, refined_voted = tpo_optimize_text(
+                    policy,
+                    q,
+                    qtype,
+                    init_out.texts,
+                    anchor_text=init_voted,
+                    reviewers=reviewer_policies,
+                    review_cache=review_cache,
+                    image=img,
+                )
 
             final_ans = final_verify(policy, img, q, qtype, refined_voted)
 
