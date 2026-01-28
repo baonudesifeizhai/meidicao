@@ -55,6 +55,7 @@ SPECIFICITY_PENALTY_MAX = 0.15
 IMAGE_SUMMARY_ENABLED = True
 IMAGE_SUMMARY_MAX_TOKENS = 64
 IMAGE_SUMMARY_TEMPERATURE = 0.0
+LOCATION_MAX_WORDS = 5
 
 MAX_QUESTIONS = 50
 MAX_SCAN = 400
@@ -166,6 +167,25 @@ _LUNG_KEYWORDS = {
     "pneumo",
 }
 _OPTION_STOPWORDS = {"yes", "no", "unknown", "not", "none", "n/a"}
+_LOCATION_NOISE_TOKENS = {
+    "near",
+    "adjacent",
+    "floor",
+    "coronary",
+    "sinus",
+    "valve",
+    "posterior",
+    "anterior",
+    "superior",
+    "inferior",
+    "medial",
+    "lateral",
+    "proximal",
+    "distal",
+}
+_LOCATION_HINTS = {
+    "pacemaker": {"heart", "atrium", "ventricle"},
+}
 
 
 def _build_keyword_set(phrases):
@@ -173,6 +193,15 @@ def _build_keyword_set(phrases):
     for phrase in phrases:
         for token in re.findall(r"[a-z]+", (phrase or "").lower()):
             tokens.add(token)
+    return tokens
+
+
+def _location_question_tokens(question):
+    tokens = set(re.findall(r"[a-z]+", (question or "").lower()))
+    tokens = {t for t in tokens if t not in _STOPWORDS}
+    for key, extras in _LOCATION_HINTS.items():
+        if key in (question or "").lower():
+            tokens.update(extras)
     return tokens
 
 
@@ -391,9 +420,26 @@ def _extract_question_keywords(question, keyword_set):
     return {k for k in keyword_set if k in ql}
 
 
+def _filter_location_specificity(question, texts):
+    if not texts:
+        return texts
+    ql = (question or "").lower()
+    filtered = []
+    for t in texts:
+        tl = (t or "").lower()
+        if _word_count(t) > LOCATION_MAX_WORDS:
+            continue
+        if any(tok in tl for tok in _LOCATION_NOISE_TOKENS) and not any(
+            tok in ql for tok in _LOCATION_NOISE_TOKENS
+        ):
+            continue
+        filtered.append(t)
+    return filtered if filtered else texts
+
+
 def _filter_by_qtype(question, qtype, texts):
     if qtype == "location":
-        q_keywords = _extract_question_keywords(question, _ANATOMY_KEYWORDS)
+        q_keywords = _location_question_tokens(question)
         filtered = []
         for t in texts:
             if not _has_any_keyword(t, _ANATOMY_KEYWORDS):
@@ -403,6 +449,7 @@ def _filter_by_qtype(question, qtype, texts):
             if q_keywords and not _has_any_keyword(t, q_keywords):
                 continue
             filtered.append(t)
+        filtered = _filter_location_specificity(question, filtered if filtered else texts)
         return filtered if filtered else texts
     if qtype == "disease":
         filtered = [t for t in texts if _has_any_keyword(t, _DISEASE_KEYWORDS)]
@@ -655,10 +702,13 @@ def _select_bank_candidates(question, candidates, qtype):
     bank = TRAIN_ANSWER_BANK.get(qtype, []) if use_train else CANDIDATE_BANK.get(qtype, [])
     if not bank:
         return []
-    tokens = set(re.findall(r"[A-Za-z]+", (question or "").lower()))
-    for t in candidates:
-        tokens.update(re.findall(r"[A-Za-z]+", (t or "").lower()))
-    tokens = {t for t in tokens if t not in _STOPWORDS}
+    if qtype == "location":
+        tokens = _location_question_tokens(question)
+    else:
+        tokens = set(re.findall(r"[A-Za-z]+", (question or "").lower()))
+        for t in candidates:
+            tokens.update(re.findall(r"[A-Za-z]+", (t or "").lower()))
+        tokens = {t for t in tokens if t not in _STOPWORDS}
     if tokens:
         filtered = [b for b in bank if any(tok in b.lower() for tok in tokens)]
         if qtype == "location":
