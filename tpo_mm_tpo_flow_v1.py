@@ -133,6 +133,16 @@ CANDIDATE_BANK = {
     ],
 }
 
+TRAIN_ANSWER_BANK_ENABLED = True
+TRAIN_ANSWER_BANK_MAX = 300
+TRAIN_ANSWER_BANK_SCAN = 5000
+TRAIN_ANSWER_BANK_DATASETS = [
+    ("SLAKE", "mdwiratathya/SLAKE-vqa-english", "train"),
+    ("VQA-RAD", "flaviagiammarino/vqa-rad", "train"),
+    ("PathVQA", "flaviagiammarino/path-vqa", "train"),
+]
+TRAIN_ANSWER_BANK = {qtype: [] for qtype in TARGET_QTYPES}
+
 _STOPWORDS = {
     "the", "is", "are", "in", "of", "on", "a", "an", "this", "that", "image", "picture",
     "where", "what", "which", "location", "located", "abnormality", "abnormalities",
@@ -260,6 +270,60 @@ def _summarize_image_for_review(policy, image, question, qtype):
     return summary or None
 
 
+def _iter_answers(ans):
+    if ans is None:
+        return []
+    if isinstance(ans, (list, tuple)):
+        return [a for a in ans if a is not None]
+    return [ans]
+
+
+def _build_train_answer_bank():
+    if not TRAIN_ANSWER_BANK_ENABLED:
+        return
+    norm_sets = {qtype: set() for qtype in TARGET_QTYPES}
+    for dataset_name, dataset_id, split in TRAIN_ANSWER_BANK_DATASETS:
+        try:
+            ds = load_dataset(dataset_id, split=split, streaming=True)
+        except Exception as exc:
+            print(f"Train bank: failed to load {dataset_name} ({dataset_id}): {exc}")
+            continue
+        it = iter(ds)
+        scanned = 0
+        while scanned < TRAIN_ANSWER_BANK_SCAN:
+            try:
+                ex = next(it)
+            except StopIteration:
+                break
+            scanned += 1
+            q = ex.get("question", ex.get("question_text", ""))
+            gt = ex.get("answer", None)
+            if not q or gt is None:
+                continue
+            qtype = classify_question(q)
+            if qtype not in TARGET_QTYPES:
+                continue
+            for ans in _iter_answers(gt):
+                text = str(ans).strip()
+                if not text:
+                    continue
+                norm = normalize_answer(text, qtype)
+                if norm in norm_sets[qtype]:
+                    continue
+                if len(TRAIN_ANSWER_BANK[qtype]) >= TRAIN_ANSWER_BANK_MAX:
+                    break
+                norm_sets[qtype].add(norm)
+                TRAIN_ANSWER_BANK[qtype].append(text)
+            if len(TRAIN_ANSWER_BANK[qtype]) >= TRAIN_ANSWER_BANK_MAX:
+                continue
+        print(
+            f"Train bank {dataset_name}: "
+            f"location={len(TRAIN_ANSWER_BANK['location'])} "
+            f"disease={len(TRAIN_ANSWER_BANK['disease'])} "
+            f"short={len(TRAIN_ANSWER_BANK['short'])}"
+        )
+
+
 def _drop_unknown_if_possible(texts, qtype):
     if not texts:
         return texts
@@ -351,9 +415,10 @@ def _inject_bilateral_location(texts, qtype, question=None):
 
 
 def _select_bank_candidates(question, candidates, qtype):
-    if not CANDIDATE_BANK_ENABLED:
+    use_train = TRAIN_ANSWER_BANK_ENABLED and TRAIN_ANSWER_BANK.get(qtype)
+    if not CANDIDATE_BANK_ENABLED and not use_train:
         return []
-    bank = CANDIDATE_BANK.get(qtype, [])
+    bank = TRAIN_ANSWER_BANK.get(qtype, []) if use_train else CANDIDATE_BANK.get(qtype, [])
     if not bank:
         return []
     tokens = set(re.findall(r"[A-Za-z]+", (question or "").lower()))
@@ -363,12 +428,15 @@ def _select_bank_candidates(question, candidates, qtype):
     if tokens:
         filtered = [b for b in bank if any(tok in b.lower() for tok in tokens)]
         if qtype == "location":
-            return filtered[:CANDIDATE_BANK_MAX]
+            limit = TRAIN_ANSWER_BANK_MAX if use_train else CANDIDATE_BANK_MAX
+            return filtered[:limit]
         if len(filtered) >= 5:
-            return filtered[:CANDIDATE_BANK_MAX]
+            limit = TRAIN_ANSWER_BANK_MAX if use_train else CANDIDATE_BANK_MAX
+            return filtered[:limit]
     if qtype == "location":
         return []
-    return bank[:CANDIDATE_BANK_MAX]
+    limit = TRAIN_ANSWER_BANK_MAX if use_train else CANDIDATE_BANK_MAX
+    return bank[:limit]
 
 
 def _expand_candidates(policy, image, question, qtype, existing):
@@ -1081,6 +1149,8 @@ DATASETS = [
     ("VQA-RAD", "flaviagiammarino/vqa-rad", "test"),
     ("PathVQA", "flaviagiammarino/path-vqa", "test"),
 ]
+
+_build_train_answer_bank()
 
 policy = VLLMOpenAIMMPolicyV5("http://localhost:8000/v1", "google/medgemma-27b-it")
 reviewer_policies = build_reviewers(REVIEWERS)
