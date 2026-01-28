@@ -14,6 +14,7 @@ from tpo_mm_policy_v5 import (
     normalize_yesno,
     rules_for,
 )
+from semantic_eval import SemanticScorer, semantic_eval
 
 YESNO_TYPES = {"contain_yesno", "healthy_yesno", "abnormal_yesno"}
 TARGET_QTYPES = {"disease", "location", "short"}
@@ -56,6 +57,12 @@ IMAGE_SUMMARY_ENABLED = True
 IMAGE_SUMMARY_MAX_TOKENS = 64
 IMAGE_SUMMARY_TEMPERATURE = 0.0
 LOCATION_MAX_WORDS = 5
+
+SEMANTIC_ENABLED = True
+SEMANTIC_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+SEMANTIC_THRESHOLD = 0.75
+SEMANTIC_DEVICE = "auto"
+SEMANTIC_MAX_LENGTH = 128
 
 MAX_QUESTIONS = 50
 MAX_SCAN = 400
@@ -1433,18 +1440,38 @@ def calculate_accuracy(results):
     
     exact_matches = sum(1 for r in results if exact_match(r["final_answer"], r["ground_truth"]))
     partial_matches = sum(1 for r in results if partial_match(r["final_answer"], r["ground_truth"]))
+    semantic_total = sum(1 for r in results if r.get("semantic_match") is not None)
+    semantic_matches = sum(1 for r in results if r.get("semantic_match") is True)
+    semantic_score_sum = sum(
+        r.get("semantic_score", 0.0) for r in results if r.get("semantic_score") is not None
+    )
     
     # Per question type
     by_type = {}
     for r in results:
         qtype = r.get("question_type", "unknown")
         if qtype not in by_type:
-            by_type[qtype] = {"total": 0, "exact": 0, "partial": 0}
+            by_type[qtype] = {
+                "total": 0,
+                "exact": 0,
+                "partial": 0,
+                "semantic_total": 0,
+                "semantic_match": 0,
+                "semantic_score_sum": 0.0,
+            }
         by_type[qtype]["total"] += 1
         if exact_match(r["final_answer"], r["ground_truth"]):
             by_type[qtype]["exact"] += 1
         if partial_match(r["final_answer"], r["ground_truth"]):
             by_type[qtype]["partial"] += 1
+        sem_match = r.get("semantic_match")
+        sem_score = r.get("semantic_score")
+        if sem_match is not None:
+            by_type[qtype]["semantic_total"] += 1
+            if sem_match is True:
+                by_type[qtype]["semantic_match"] += 1
+            if sem_score is not None:
+                by_type[qtype]["semantic_score_sum"] += sem_score
     
     metrics = {
         "total": total,
@@ -1452,11 +1479,25 @@ def calculate_accuracy(results):
         "exact_match_rate": exact_matches / total if total > 0 else 0.0,
         "partial_match": partial_matches,
         "partial_match_rate": partial_matches / total if total > 0 else 0.0,
+        "semantic_total": semantic_total,
+        "semantic_match": semantic_matches,
+        "semantic_match_rate": semantic_matches / semantic_total if semantic_total > 0 else None,
+        "semantic_avg_score": semantic_score_sum / semantic_total if semantic_total > 0 else None,
         "by_type": {
             qtype: {
                 "total": stats["total"],
                 "exact_match_rate": stats["exact"] / stats["total"] if stats["total"] > 0 else 0.0,
                 "partial_match_rate": stats["partial"] / stats["total"] if stats["total"] > 0 else 0.0,
+                "semantic_match_rate": (
+                    stats["semantic_match"] / stats["semantic_total"]
+                    if stats["semantic_total"] > 0
+                    else None
+                ),
+                "semantic_avg_score": (
+                    stats["semantic_score_sum"] / stats["semantic_total"]
+                    if stats["semantic_total"] > 0
+                    else None
+                ),
             }
             for qtype, stats in by_type.items()
         }
@@ -1476,6 +1517,12 @@ _build_train_answer_bank()
 
 policy = VLLMOpenAIMMPolicyV5("http://localhost:8000/v1", "google/medgemma-27b-it")
 reviewer_policies = build_reviewers(REVIEWERS)
+semantic_scorer = SemanticScorer(
+    enabled=SEMANTIC_ENABLED,
+    model_name=SEMANTIC_MODEL,
+    device=SEMANTIC_DEVICE,
+    max_length=SEMANTIC_MAX_LENGTH,
+)
 
 total_seen = 0
 dataset_stats = {name: {"seen": 0, "processed": 0} for name, _, _ in DATASETS}
@@ -1594,6 +1641,14 @@ for dataset_name, dataset_id, split in DATASETS:
                     refined_voted = override
 
             final_ans = final_verify(policy, img, q, qtype, refined_voted)
+            semantic_match, semantic_score = (None, None)
+            if SEMANTIC_ENABLED:
+                semantic_match, semantic_score = semantic_eval(
+                    final_ans,
+                    gt,
+                    semantic_scorer,
+                    threshold=SEMANTIC_THRESHOLD,
+                )
 
             print("=" * 70)
             print(f"[{dataset_name}] Q{qi} type={qtype}")
@@ -1615,6 +1670,9 @@ for dataset_name, dataset_id, split in DATASETS:
                     print(f"  {i}: {t}")
                 print("refined voted:", refined_voted)
             print("final:", final_ans)
+            if semantic_score is not None:
+                sm = "✓" if semantic_match else "✗"
+                print(f"semantic: {semantic_score:.2f} ({sm})")
 
             # Save results for validation
             result = {
@@ -1638,6 +1696,8 @@ for dataset_name, dataset_id, split in DATASETS:
                 "final_answer": final_ans,
                 "exact_match": exact_match(final_ans, gt) if gt else None,
                 "partial_match": partial_match(final_ans, gt) if gt else None,
+                "semantic_match": semantic_match,
+                "semantic_score": semantic_score,
             }
             all_results[dataset_name].append(result)
 
@@ -1673,6 +1733,12 @@ for dataset_name in DATASETS:
         print(f"  Total questions: {metrics['total']}")
         print(f"  Exact match: {metrics['exact_match']}/{metrics['total']} ({metrics['exact_match_rate']:.2%})")
         print(f"  Partial match: {metrics['partial_match']}/{metrics['total']} ({metrics['partial_match_rate']:.2%})")
+        if metrics.get("semantic_total"):
+            print(
+                f"  Semantic match: {metrics['semantic_match']}/{metrics['semantic_total']} "
+                f"({metrics['semantic_match_rate']:.2%}) "
+                f"avg={metrics['semantic_avg_score']:.2f}"
+            )
         print(f"  By question type:")
         for qtype, type_stats in metrics['by_type'].items():
             print(f"    {qtype}: {type_stats['exact_match_rate']:.2%} exact, {type_stats['partial_match_rate']:.2%} partial")
@@ -1689,6 +1755,12 @@ if all_results_flat:
     print(f"  Total questions: {overall_metrics['total']}")
     print(f"  Exact match: {overall_metrics['exact_match']}/{overall_metrics['total']} ({overall_metrics['exact_match_rate']:.2%})")
     print(f"  Partial match: {overall_metrics['partial_match']}/{overall_metrics['total']} ({overall_metrics['partial_match_rate']:.2%})")
+    if overall_metrics.get("semantic_total"):
+        print(
+            f"  Semantic match: {overall_metrics['semantic_match']}/{overall_metrics['semantic_total']} "
+            f"({overall_metrics['semantic_match_rate']:.2%}) "
+            f"avg={overall_metrics['semantic_avg_score']:.2f}"
+        )
 
     tpo_used_results = [r for r in all_results_flat if r.get("tpo_used")]
     tpo_skipped_results = [r for r in all_results_flat if r.get("tpo_used") is False]
