@@ -47,6 +47,8 @@ UNKNOWN_PENALTY = 0.8  # Increased: strongly penalize Unknown
 REVIEW_WEIGHT = 0.4  # Increased: reviewer can help identify correct answers
 REVIEW_DEBUG = True
 REVIEW_MAX_TOKENS = 12
+REVIEWER_REPEAT = 2
+REVIEWER_REQUIRE_CONSISTENT = True
 SPECIFICITY_PENALTY_LOBE = 0.05
 SPECIFICITY_PENALTY_COMMA = 0.03
 SPECIFICITY_PENALTY_MAX = 0.15
@@ -142,6 +144,7 @@ TRAIN_ANSWER_BANK_DATASETS = [
     ("PathVQA", "flaviagiammarino/path-vqa", "train"),
 ]
 TRAIN_ANSWER_BANK = {qtype: [] for qtype in TARGET_QTYPES}
+TRAIN_ANSWER_BANK_NORMS = {qtype: set() for qtype in TARGET_QTYPES}
 
 _STOPWORDS = {
     "the", "is", "are", "in", "of", "on", "a", "an", "this", "that", "image", "picture",
@@ -162,6 +165,79 @@ _LUNG_KEYWORDS = {
     "alveol",
     "pneumo",
 }
+_OPTION_STOPWORDS = {"yes", "no", "unknown", "not", "none", "n/a"}
+
+
+def _build_keyword_set(phrases):
+    tokens = set()
+    for phrase in phrases:
+        for token in re.findall(r"[a-z]+", (phrase or "").lower()):
+            tokens.add(token)
+    return tokens
+
+
+_ANATOMY_KEYWORDS = _build_keyword_set(CANDIDATE_BANK["location"] + CANDIDATE_BANK["short"])
+_ANATOMY_KEYWORDS.update(_LUNG_KEYWORDS)
+_ANATOMY_KEYWORDS.update(
+    {
+        "lung",
+        "lungs",
+        "lobe",
+        "lobes",
+        "pleura",
+        "pleural",
+        "mediastinum",
+        "thorax",
+        "chest",
+        "abdomen",
+        "pelvis",
+        "heart",
+        "cardiac",
+        "atrium",
+        "ventricle",
+        "brain",
+        "spine",
+        "kidney",
+        "liver",
+        "spleen",
+        "pancreas",
+        "stomach",
+        "apex",
+        "hilum",
+        "hemithorax",
+        "costophrenic",
+        "rib",
+        "ribs",
+    }
+)
+_DISEASE_KEYWORDS = _build_keyword_set(CANDIDATE_BANK["disease"])
+_DISEASE_KEYWORDS.update(
+    {
+        "lesion",
+        "abnormality",
+        "abnormalities",
+        "opacity",
+        "shadow",
+        "normal",
+        "negative",
+        "clear",
+        "unremarkable",
+        "tumor",
+        "mass",
+        "nodule",
+        "effusion",
+        "atelectasis",
+        "pneumonia",
+        "edema",
+        "emphysema",
+        "fibrosis",
+        "fracture",
+        "hernia",
+        "consolidation",
+        "infiltration",
+        "cancer",
+    }
+)
 
 
 def _contains_lung_keywords(text):
@@ -223,6 +299,165 @@ def _word_count(text):
     return len(re.findall(r"[A-Za-z0-9]+", text or ""))
 
 
+def _normalize_candidate_texts(texts):
+    out = []
+    for text in texts or []:
+        if text is None:
+            continue
+        cleaned = " ".join(str(text).split()).strip()
+        if cleaned:
+            out.append(cleaned)
+    return out
+
+
+def _clean_option_text(text):
+    if not text:
+        return ""
+    cleaned = str(text).strip()
+    cleaned = re.sub(r"^[\s\-\*\d\.\)\:]+", "", cleaned)
+    cleaned = re.sub(r"[?!.;:,]+$", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def _extract_option_candidates(question):
+    if not question:
+        return []
+    q = str(question).strip()
+    options = []
+    q_norm = re.sub(r"\s*/\s*", "/", q)
+    for match in re.finditer(
+        r"([A-Za-z][A-Za-z0-9\s\-]{0,40}(?:/[A-Za-z][A-Za-z0-9\s\-]{0,40})+)",
+        q_norm,
+    ):
+        segment = match.group(1)
+        options.extend([p.strip() for p in segment.split("/") if p.strip()])
+    if re.search(r"\sor\s", q, flags=re.I):
+        tail = re.split(r"[?:.]", q)[-1]
+        if re.search(r"\sor\s", tail, flags=re.I):
+            parts = re.split(r"\s+or\s+", tail, flags=re.I)
+            for part in parts:
+                options.extend([p.strip() for p in part.split(",") if p.strip()])
+    cleaned = []
+    for opt in options:
+        opt = _clean_option_text(opt)
+        if not opt:
+            continue
+        if opt.lower() in _OPTION_STOPWORDS:
+            continue
+        if _word_count(opt) > 6:
+            continue
+        cleaned.append(opt)
+    deduped = []
+    seen = set()
+    for opt in cleaned:
+        key = opt.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(opt)
+    if len(deduped) < 2 or len(deduped) > 6:
+        return []
+    return deduped
+
+
+def _is_clean_candidate(text):
+    cleaned = " ".join((text or "").split()).strip()
+    if not cleaned:
+        return False
+    if len(cleaned) > 60:
+        return False
+    if _word_count(cleaned) > 8:
+        return False
+    if re.search(r"[.!?]", cleaned):
+        return False
+    if re.search(r"\b(because|since|due to|as a result|therefore|based on)\b", cleaned.lower()):
+        return False
+    return True
+
+
+def _apply_format_filter(texts):
+    filtered = [t for t in texts if _is_clean_candidate(t)]
+    return filtered if filtered else texts
+
+
+def _has_any_keyword(text, keywords):
+    tl = (text or "").lower()
+    return any(k in tl for k in keywords)
+
+
+def _extract_question_keywords(question, keyword_set):
+    ql = (question or "").lower()
+    return {k for k in keyword_set if k in ql}
+
+
+def _filter_by_qtype(question, qtype, texts):
+    if qtype == "location":
+        q_keywords = _extract_question_keywords(question, _ANATOMY_KEYWORDS)
+        filtered = []
+        for t in texts:
+            if not _has_any_keyword(t, _ANATOMY_KEYWORDS):
+                continue
+            if _has_any_keyword(t, _DISEASE_KEYWORDS):
+                continue
+            if q_keywords and not _has_any_keyword(t, q_keywords):
+                continue
+            filtered.append(t)
+        return filtered if filtered else texts
+    if qtype == "disease":
+        filtered = [t for t in texts if _has_any_keyword(t, _DISEASE_KEYWORDS)]
+        return filtered if filtered else texts
+    if qtype == "short":
+        filtered = [
+            t
+            for t in texts
+            if _has_any_keyword(t, _ANATOMY_KEYWORDS)
+            and not _has_any_keyword(t, _DISEASE_KEYWORDS)
+        ]
+        return filtered if filtered else texts
+    return texts
+
+
+def _filter_by_train_bank(texts, qtype):
+    if not TRAIN_ANSWER_BANK_ENABLED:
+        return texts
+    norms = TRAIN_ANSWER_BANK_NORMS.get(qtype)
+    if not norms:
+        return texts
+    filtered = [t for t in texts if normalize_answer(t, qtype) in norms]
+    if filtered:
+        return filtered
+    bank = TRAIN_ANSWER_BANK.get(qtype, [])
+    return bank[: min(len(bank), TRAIN_ANSWER_BANK_MAX)] if bank else texts
+
+
+def _apply_candidate_filters(question, qtype, texts, options=None):
+    texts = _normalize_candidate_texts(texts)
+    if not texts:
+        return texts
+    options = options or _extract_option_candidates(question)
+    if options:
+        options = _apply_format_filter(_normalize_candidate_texts(options))
+        if not options:
+            return texts
+        option_norms = {normalize_answer(o, qtype) for o in options}
+        filtered = [t for t in texts if normalize_answer(t, qtype) in option_norms]
+        if not filtered:
+            filtered = list(options)
+        else:
+            existing = {normalize_answer(t, qtype) for t in filtered}
+            for opt in options:
+                if normalize_answer(opt, qtype) not in existing:
+                    filtered.append(opt)
+        return _dedup_candidates(filtered, qtype)
+    filtered = _apply_format_filter(texts)
+    filtered = _drop_unknown_if_possible(filtered, qtype)
+    filtered = _filter_by_qtype(question, qtype, filtered)
+    filtered = _filter_by_train_bank(filtered, qtype)
+    filtered = _dedup_candidates(filtered, qtype)
+    return filtered
+
+
 def _is_ambiguous_short(question):
     ql = (question or "").lower()
     return any(k in ql for k in AMBIG_KEYWORDS)
@@ -281,7 +516,6 @@ def _iter_answers(ans):
 def _build_train_answer_bank():
     if not TRAIN_ANSWER_BANK_ENABLED:
         return
-    norm_sets = {qtype: set() for qtype in TARGET_QTYPES}
     for dataset_name, dataset_id, split in TRAIN_ANSWER_BANK_DATASETS:
         try:
             ds = load_dataset(dataset_id, split=split, streaming=True)
@@ -308,11 +542,11 @@ def _build_train_answer_bank():
                 if not text:
                     continue
                 norm = normalize_answer(text, qtype)
-                if norm in norm_sets[qtype]:
+                if norm in TRAIN_ANSWER_BANK_NORMS[qtype]:
                     continue
                 if len(TRAIN_ANSWER_BANK[qtype]) >= TRAIN_ANSWER_BANK_MAX:
                     break
-                norm_sets[qtype].add(norm)
+                TRAIN_ANSWER_BANK_NORMS[qtype].add(norm)
                 TRAIN_ANSWER_BANK[qtype].append(text)
             if len(TRAIN_ANSWER_BANK[qtype]) >= TRAIN_ANSWER_BANK_MAX:
                 continue
@@ -776,47 +1010,69 @@ def _review_scores_for_pool(
     scores = {norm: 0.0 for norm in norms}
     weight_sum = 0.0
     for cfg, reviewer in reviewers:
+        if qtype == "short" and cfg.get("type") == "hf":
+            if REVIEW_DEBUG:
+                print(f"  RM[{cfg['name']}] skipped (short question: text reviewer disabled)")
+            continue
         key = (cfg["name"], qtype, question, tuple(norms), image is not None, image_summary)
         if key not in cache:
-            used_summary = False
             try:
-                if image is not None and prompt_mm is not None:
-                    raw = reviewer.generate(prompt_mm, image=image)
-                else:
-                    raw = reviewer.generate(prompt_text, image=None)
-            except NotImplementedError:
-                if prompt_text and image_summary:
+                used_summary = False
+                choices = []
+                last_raw = None
+                for _ in range(max(1, REVIEWER_REPEAT)):
                     try:
-                        raw = reviewer.generate(prompt_text, image=None)
-                        used_summary = True
-                    except Exception:
-                        if REVIEW_DEBUG:
-                            print(f"  RM[{cfg['name']}] skipped (multimodal not supported)")
-                        continue
-                else:
+                        if image is not None and prompt_mm is not None:
+                            raw = reviewer.generate(prompt_mm, image=image)
+                        else:
+                            raw = reviewer.generate(prompt_text, image=None)
+                        last_raw = raw
+                    except NotImplementedError:
+                        if prompt_text and image_summary:
+                            raw = reviewer.generate(prompt_text, image=None)
+                            last_raw = raw
+                            used_summary = True
+                        else:
+                            if REVIEW_DEBUG:
+                                print(f"  RM[{cfg['name']}] skipped (multimodal not supported)")
+                            last_raw = None
+                            choices = []
+                            break
+                    choice = _parse_choice(last_raw, len(norms))
+                    choices.append(choice)
+                if not choices or any(c is None for c in choices):
                     if REVIEW_DEBUG:
-                        print(f"  RM[{cfg['name']}] skipped (multimodal not supported)")
-                    continue
+                        print(f"  RM[{cfg['name']}] invalid choice (skipped)")
+                    cache[key] = None
+                elif REVIEWER_REQUIRE_CONSISTENT and len(set(choices)) > 1:
+                    if REVIEW_DEBUG:
+                        print(f"  RM[{cfg['name']}] inconsistent choices={choices} (skipped)")
+                    cache[key] = None
+                else:
+                    choice = choices[0]
+                    if REVIEW_DEBUG:
+                        raw_display = " ".join((last_raw or "").split())
+                        choice_display = "None" if choice is None else str(choice)
+                        picked = "None" if choice is None else norms[choice - 1]
+                        if image is not None and not used_summary:
+                            img_tag = " [with image]"
+                        elif image_summary:
+                            img_tag = " [summary]"
+                        else:
+                            img_tag = ""
+                        print(
+                            f"  RM[{cfg['name']}] choice={choice_display} norm={picked} raw={raw_display!r}{img_tag}"
+                        )
+                    cache[key] = choice
             except requests.exceptions.RequestException as exc:
                 if REVIEW_DEBUG:
                     print(f"  RM[{cfg['name']}] error={exc.__class__.__name__}: {exc} (skipped)")
                 cache[key] = None
+            except Exception as exc:
+                if REVIEW_DEBUG:
+                    print(f"  RM[{cfg['name']}] error={exc.__class__.__name__}: {exc} (skipped)")
+                cache[key] = None
                 continue
-            choice = _parse_choice(raw, len(norms))
-            if REVIEW_DEBUG:
-                raw_display = " ".join((raw or "").split())
-                choice_display = "None" if choice is None else str(choice)
-                picked = "None" if choice is None else norms[choice - 1]
-                if image is not None and not used_summary:
-                    img_tag = " [with image]"
-                elif image_summary:
-                    img_tag = " [summary]"
-                else:
-                    img_tag = ""
-                print(
-                    f"  RM[{cfg['name']}] choice={choice_display} norm={picked} raw={raw_display!r}{img_tag}"
-                )
-            cache[key] = choice
         cached = cache.get(key)
         if cached is None:
             continue
@@ -900,22 +1156,27 @@ def tpo_optimize_text(
     image=None,
     image_summary=None,
 ):
-    pool = _drop_unknown_if_possible(candidates, qtype)
+    options = _extract_option_candidates(question)
+    pool = _apply_candidate_filters(question, qtype, candidates, options=options)
     rules, _ = rules_for(qtype)
-    init_norms = {normalize_answer(t, qtype) for t in candidates}
+    init_norms = {normalize_answer(t, qtype) for t in pool}
     if not anchor_text and candidates:
-        anchor_text = candidates[0]
+        anchor_text = pool[0] if pool else candidates[0]
     anchor_norm = normalize_answer(anchor_text, qtype) if anchor_text else None
+    option_norms = {normalize_answer(o, qtype) for o in options} if options else None
+    if option_norms and anchor_norm not in option_norms:
+        anchor_norm = None
+        anchor_text = None
     # If anchor is Unknown but other answers exist, do not force-keep Unknown.
     if anchor_norm == "Unknown":
-        if any(normalize_answer(t, qtype) != "Unknown" for t in candidates):
+        if any(normalize_answer(t, qtype) != "Unknown" for t in pool):
             anchor_norm = None
     review_cache = review_cache or {}
     
     # Check initial consensus: if anchor appears in 3+ out of 5 initial samples, it's likely correct
     # BUT: high consensus doesn't guarantee correctness (models can collectively be wrong)
     # So we use this only for early stopping, not for extra bonus
-    init_norm_list = [normalize_answer(t, qtype) for t in candidates]
+    init_norm_list = [normalize_answer(t, qtype) for t in pool]
     anchor_freq_in_init = init_norm_list.count(anchor_norm) if anchor_norm else 0
     high_consensus_anchor = anchor_freq_in_init >= 3  # 3/5 = 60% consensus
     # REMOVED: high consensus bonus - models can collectively be wrong
@@ -1015,7 +1276,13 @@ def tpo_optimize_text(
                 )
 
         pool = [t for _, t, _, _ in selected] + new_candidates
-        if anchor_text and anchor_norm and all(normalize_answer(t, qtype) != anchor_norm for t in pool):
+        pool = _apply_candidate_filters(question, qtype, pool, options=options)
+        if (
+            anchor_text
+            and anchor_norm
+            and (not option_norms or anchor_norm in option_norms)
+            and all(normalize_answer(t, qtype) != anchor_norm for t in pool)
+        ):
             pool.append(anchor_text)
         if len(pool) > POOL_SIZE:
             norm_pool = [normalize_answer(t, qtype) for t in pool]
@@ -1040,7 +1307,12 @@ def tpo_optimize_text(
                 scored.append((score, t, n, review))
             scored.sort(key=lambda x: x[0], reverse=True)
             pool = [t for _, t, _, _ in scored[:POOL_SIZE]]
-            if anchor_text and anchor_norm and all(normalize_answer(t, qtype) != anchor_norm for t in pool):
+            if (
+                anchor_text
+                and anchor_norm
+                and (not option_norms or anchor_norm in option_norms)
+                and all(normalize_answer(t, qtype) != anchor_norm for t in pool)
+            ):
                 pool[-1] = anchor_text
 
     voted, _ = vote_texts(pool, qtype)
@@ -1214,9 +1486,9 @@ for dataset_name, dataset_id, split in DATASETS:
             diverse_out = policy.generate_n_mm(img, q, n=diverse_n, use_gate=True, temperature=1.2, top_p=0.85)
             init_texts = [anchor_text] + [t for t in diverse_out.texts if t]
             init_texts = _drop_unknown_if_possible(init_texts, qtype)
-            if normalize_answer(anchor_text, qtype) == "Unknown" and any(
-                normalize_answer(t, qtype) != "Unknown" for t in init_texts
-            ):
+            options = _extract_option_candidates(q)
+            init_texts = _apply_candidate_filters(q, qtype, init_texts, options=options)
+            if init_texts:
                 init_voted, _ = vote_texts(init_texts, qtype)
             else:
                 init_voted = anchor_text
@@ -1234,9 +1506,16 @@ for dataset_name, dataset_id, split in DATASETS:
                 expanded_texts = _expand_candidates(policy, img, q, qtype, init_samples)
                 if len(expanded_texts) > len(init_samples):
                     print(f"  [Candidate expansion: {len(init_samples)} -> {len(expanded_texts)}]")
+            expanded_texts = _apply_candidate_filters(q, qtype, expanded_texts, options=options)
 
             image_summary = None
-            if IMAGE_SUMMARY_ENABLED and not skip_tpo and img is not None and HAS_TEXT_REVIEWER:
+            if (
+                IMAGE_SUMMARY_ENABLED
+                and qtype in ("location", "disease")
+                and not skip_tpo
+                and img is not None
+                and HAS_TEXT_REVIEWER
+            ):
                 image_summary = _summarize_image_for_review(policy, img, q, qtype)
                 if REVIEW_DEBUG and image_summary:
                     print(f"  [Image summary] {image_summary}")
